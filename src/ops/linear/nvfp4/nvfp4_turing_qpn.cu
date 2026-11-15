@@ -7,6 +7,7 @@
 #include "ops/common/math.cuh"
 #include "core/device_launch.h"
 #include "core/layout.h"
+#include "core/qtype.h"
 #include "ninfer/ops/silu_mul.h"
 
 #include <cuda_bf16.h>

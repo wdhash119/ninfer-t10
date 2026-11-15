@@ -176,8 +176,11 @@ bool marlin_sm75_supported(GgmlType type, int rows, int k, int columns) {
         const char* value = std::getenv("NINFER_GGUF_MARLIN");
         return value != nullptr && std::atoi(value) == 1;
     }();
+    // A kernel unit holds GgmlType opaque (ggml_bridge_args.h); its values are the ggml_type ids
+    // a GGUF tensor directory carries, so the type test goes through those ids.
+    const int type_id = static_cast<int>(type);
     return enabled && detail::device_facts().cc == 750 &&
-           (type == GgmlType::Q4_K || type == GgmlType::Q5_K) && rows > 0 && k > 0 &&
+           (type_id == GGML_TYPE_Q4_K || type_id == GGML_TYPE_Q5_K) && rows > 0 && k > 0 &&
            k % 256 == 0 && columns >= 128;
 }
 
@@ -201,12 +204,12 @@ void marlin_sm75_product(GgmlType type, const void* weight, std::int64_t row_byt
     if (!marlin_sm75_supported(type, rows, k, columns)) {
         throw std::invalid_argument("SM75 Marlin-like product: unsupported geometry or type");
     }
-    switch (type) {
-    case GgmlType::Q4_K:
+    switch (static_cast<int>(type)) {
+    case GGML_TYPE_Q4_K:
         marlin_launch<GGML_TYPE_Q4_K>(weight, row_bytes, rows, k, activation, columns, out,
                                       out_stride, stream);
         return;
-    case GgmlType::Q5_K:
+    case GGML_TYPE_Q5_K:
         marlin_launch<GGML_TYPE_Q5_K>(weight, row_bytes, rows, k, activation, columns, out,
                                       out_stride, stream);
         return;
