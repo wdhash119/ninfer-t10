@@ -1,6 +1,7 @@
 #include "core/weight.h"
 #include "ninfer/ops/linear.h"
 
+#include "ops/common/device_tier.h"
 #include "ops/linear/bf16/bf16_dispatch.h"
 #include "ops/linear/bf16/bf16_vector.h"
 #include "ops/linear/fp8/fp8_dispatch.h"
@@ -16,6 +17,8 @@
 #include "ops/linear/sm70/sm70_project.h"
 #include "ops/linear/t2/t2_a8.h"
 #include "ops/linear/t2/t2_dispatch.h"
+#include "ops/linear_swiglu/q4cublas/cublas_prefill_gate.h"
+#include "ops/linear_swiglu/q4cublas/w4_cublas_prefill.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -94,6 +97,18 @@ bool sm70_route(const Tensor& x, const Weight& w, LinearPolicy policy,
            (workspace != nullptr || detail::sm70::direct_tokens(x.ne[1]));
 }
 
+const detail::CublasPrefillFamily* t10_cublas_partial_family(std::int32_t rows,
+                                                               std::int32_t cols,
+                                                               LinearPolicy policy) {
+    if (current_device_tier() != DeviceTier::Turing || !allows_cublas_prefill(policy)) {
+        return nullptr;
+    }
+    if (cols == 5120 && (rows == 17408 || rows == 8704 || rows == 4352)) {
+        return &detail::kCublasGateUp;
+    }
+    return rows == 5120 ? detail::cublas_linear_add_family(cols) : nullptr;
+}
+
 void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
                      WorkspaceArena* workspace, cudaStream_t stream) {
     if (sm70_route(x, w, policy, workspace)) {
@@ -119,6 +134,21 @@ void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy
         }
         detail::gguf_linear(x, w, out, *workspace, stream);
         return;
+    }
+    if (workspace != nullptr &&
+        (out.dtype == DType::FP32 || out.dtype == DType::BF16) &&
+        (w.qtype == QType::Q4_G64_FP16 || w.qtype == QType::Q5_G64_FP16) &&
+        t10_cublas_partial_family(w.n, w.k, policy) != nullptr) {
+        const auto* family = t10_cublas_partial_family(w.n, w.k, policy);
+        if (detail::cublas_prefill_takes(*family, x.ne[1]) &&
+            detail::w4_cublas_prefill_supported(w, x.ne[1])) {
+            if (out.dtype == DType::FP32) {
+                detail::w4_cublas_store_fp32_launch(x, w, out, *workspace, stream);
+            } else {
+                detail::w4_cublas_store_bf16_launch(x, w, out, *workspace, stream);
+            }
+            return;
+        }
     }
     switch (w.qtype) {
     case QType::Q4_G64_FP16:
@@ -163,13 +193,20 @@ std::size_t linear_route_workspace_bytes(QType qtype, std::int32_t output_rows,
                                          std::int32_t min_tokens, std::int32_t max_tokens) {
     switch (qtype) {
     case QType::Q4_G64_FP16:
-        (void)detail::select_q4_launch(output_rows, input_rows, min_tokens, policy);
-        (void)detail::select_q4_launch(output_rows, input_rows, max_tokens, policy);
-        return 0;
-    case QType::Q5_G64_FP16:
-        (void)detail::select_q5_launch(output_rows, input_rows, min_tokens, policy);
-        (void)detail::select_q5_launch(output_rows, input_rows, max_tokens, policy);
-        return 0;
+    case QType::Q5_G64_FP16: {
+        if (qtype == QType::Q4_G64_FP16) {
+            (void)detail::select_q4_launch(output_rows, input_rows, min_tokens, policy);
+            (void)detail::select_q4_launch(output_rows, input_rows, max_tokens, policy);
+        } else {
+            (void)detail::select_q5_launch(output_rows, input_rows, min_tokens, policy);
+            (void)detail::select_q5_launch(output_rows, input_rows, max_tokens, policy);
+        }
+        const auto* family = t10_cublas_partial_family(output_rows, input_rows, policy);
+        if (family == nullptr) { return 0; }
+        const std::int32_t first = detail::cublas_prefill_first_width(*family, min_tokens, max_tokens);
+        return first == 0 ? 0 : detail::w4_cublas_prefill_workspace_capacity_bytes(
+                                    output_rows, input_rows, first, max_tokens);
+    }
     case QType::Q6_G64_FP16:
         (void)detail::select_q6_launch(output_rows, input_rows, min_tokens, policy);
         (void)detail::select_q6_launch(output_rows, input_rows, max_tokens, policy);

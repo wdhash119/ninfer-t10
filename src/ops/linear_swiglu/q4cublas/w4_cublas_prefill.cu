@@ -274,6 +274,30 @@ __global__ void store_epilogue(const int* __restrict__ c, const float* __restric
         __float2bfloat16(value);
 }
 
+__global__ void store_fp32_epilogue(const int* __restrict__ c, const float* __restrict__ row_scale,
+                                    const float* __restrict__ token_scale, int n, int tokens,
+                                    int token_base, float* __restrict__ out) {
+    const int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= n * tokens) { return; }
+    const int row   = index % n;
+    const int token = index / n;
+    out[static_cast<std::size_t>(token_base + token) * n + row] =
+        static_cast<float>(c[static_cast<std::size_t>(token) * n + row]) * row_scale[row] *
+        token_scale[token_base + token];
+}
+
+__global__ void store_bf16_epilogue(const int* __restrict__ c, const float* __restrict__ row_scale,
+                                    const float* __restrict__ token_scale, int n, int tokens,
+                                    int token_base, __nv_bfloat16* __restrict__ out) {
+    const int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= n * tokens) { return; }
+    const int row   = index % n;
+    const int token = index / n;
+    const float value = static_cast<float>(c[static_cast<std::size_t>(token) * n + row]) *
+                        row_scale[row] * token_scale[token_base + token];
+    out[static_cast<std::size_t>(token_base + token) * n + row] = __float2bfloat16(value);
+}
+
 __global__ void add_epilogue(const int* __restrict__ c, const float* __restrict__ row_scale,
                              const float* __restrict__ token_scale, int n, int tokens,
                              int token_base, __nv_bfloat16* __restrict__ residual, int out_ld) {
@@ -476,6 +500,61 @@ void w4_cublas_add_launch(const Tensor& x, const Weight& weight, Tensor& residua
         const int blocks = (total + 255) / 256;
         add_epilogue<<<blocks, 256, 0, stream>>>(s.c32, s.row_scale, s.token_scale, n, tile, base,
                                                  static_cast<__nv_bfloat16*>(residual.data), n);
+        CUDA_CHECK(cudaGetLastError());
+    }
+}
+
+void w4_cublas_store_fp32_launch(const Tensor& x, const Weight& weight, Tensor& out,
+                                 WorkspaceArena& workspace, cudaStream_t stream) {
+    const std::int32_t tokens = x.ne[1];
+    const std::int32_t n      = weight.n;
+    const std::int32_t k      = weight.k;
+    if (!w4_cublas_prefill_supported(weight, tokens) || out.dtype != DType::FP32 ||
+        out.ne[0] != n) {
+        throw std::invalid_argument("cuBLAS prefill FP32 store: unsupported shape");
+    }
+    const auto scope = workspace.scope();
+    const Scratch s  = take_scratch(workspace, n, k, tokens);
+    prepare(weight, x, tokens, s, stream);
+
+    cublasHandle_t blas = handle_for_current_device();
+    check_blas(cublasSetStream(blas, stream), "cublasSetStream");
+    const std::int32_t step = cublas_token_tile(n, tokens);
+    for (std::int32_t base = 0; base < tokens; base += step) {
+        const std::int32_t tile = std::min(step, tokens - base);
+        gemm_tile(blas, s, n, k, base, tile);
+        const int total  = n * tile;
+        const int blocks = (total + 255) / 256;
+        store_fp32_epilogue<<<blocks, 256, 0, stream>>>(s.c32, s.row_scale, s.token_scale, n,
+                                                        tile, base, static_cast<float*>(out.data));
+        CUDA_CHECK(cudaGetLastError());
+    }
+}
+
+void w4_cublas_store_bf16_launch(const Tensor& x, const Weight& weight, Tensor& out,
+                                 WorkspaceArena& workspace, cudaStream_t stream) {
+    const std::int32_t tokens = x.ne[1];
+    const std::int32_t n      = weight.n;
+    const std::int32_t k      = weight.k;
+    if (!w4_cublas_prefill_supported(weight, tokens) || out.dtype != DType::BF16 ||
+        out.ne[0] != n) {
+        throw std::invalid_argument("cuBLAS prefill BF16 store: unsupported shape");
+    }
+    const auto scope = workspace.scope();
+    const Scratch s  = take_scratch(workspace, n, k, tokens);
+    prepare(weight, x, tokens, s, stream);
+
+    cublasHandle_t blas = handle_for_current_device();
+    check_blas(cublasSetStream(blas, stream), "cublasSetStream");
+    const std::int32_t step = cublas_token_tile(n, tokens);
+    for (std::int32_t base = 0; base < tokens; base += step) {
+        const std::int32_t tile = std::min(step, tokens - base);
+        gemm_tile(blas, s, n, k, base, tile);
+        const int total  = n * tile;
+        const int blocks = (total + 255) / 256;
+        store_bf16_epilogue<<<blocks, 256, 0, stream>>>(s.c32, s.row_scale, s.token_scale, n,
+                                                        tile, base,
+                                                        static_cast<__nv_bfloat16*>(out.data));
         CUDA_CHECK(cudaGetLastError());
     }
 }

@@ -8,6 +8,7 @@
 #include "ops/linear/fp8/fp8_format.h"
 #include "ops/linear/gguf/gguf_linear.h"
 #include "ops/linear/nvfp4/nvfp4_format.h"
+#include "ops/linear/nvfp4/nvfp4_launch.h"
 #include "ops/linear/sm70/sm70_dequantize.h"
 #include "ops/linear/sm70/sm70_gemm.h"
 #include "ops/linear/sm70/sm70_integer.h"
@@ -314,6 +315,11 @@ void linear_swiglu(const Tensor& x, const Weight& gate_weight, const Weight& up_
         out.ne[1] != x.ne[1]) {
         throw std::invalid_argument("linear_swiglu: invalid two-parent shapes");
     }
+    if (!allows_a4(policy) && detail::nvfp4_turing_qpn_supported(gate_weight, x.ne[1]) &&
+        detail::nvfp4_turing_qpn_supported(up_weight, x.ne[1])) {
+        detail::nvfp4_turing_qpn_linear_swiglu_pair(x, gate_weight, up_weight, out, ws, stream);
+        return;
+    }
     // One column through Q4 parents: both rows of a pair in one pass, as the one-parent GEMV.
     if (x.ne[1] == 1 && !detail::sm70::covers(gate_weight, 1) &&
         detail::q4_linear_swiglu_two_parent_gemv_supported(gate_weight, up_weight) &&
@@ -339,6 +345,10 @@ std::size_t linear_swiglu_pair_workspace_capacity_bytes(QType gate_qtype, QType 
     if (!is_gguf(gate_qtype) || !is_gguf(up_qtype)) {
         if (!fp32_pair(gate_qtype, up_qtype) || min_tokens <= 0 || max_tokens < min_tokens) {
             throw std::invalid_argument("linear_swiglu workspace: unsupported two-parent form");
+        }
+        if (gate_qtype == QType::NVFP4 && up_qtype == QType::NVFP4 && !allows_a4(policy) &&
+            max_tokens <= 64 && detail::nvfp4_turing_qpn_enabled_tokens(max_tokens)) {
+            return detail::nvfp4_turing_qpn_activation_bytes(input_rows, max_tokens);
         }
         WorkspaceLayoutBuilder layout;
         (void)layout.alloc(DType::FP32, {rows, max_tokens});

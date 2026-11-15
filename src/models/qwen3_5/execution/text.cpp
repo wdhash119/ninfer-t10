@@ -8,6 +8,7 @@
 #include "models/qwen3_5/execution/workspace.h"
 
 #include "core/nvtx.h"
+#include "ops/common/device_tier.h"
 #include "models/qwen3_5/execution/visual_scatter.h"
 #include "models/qwen3_5/execution/vision.h"
 #include "models/qwen3_5/program/vision_control.h"
@@ -47,6 +48,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstdint>
 #include <initializer_list>
 #include <limits>
@@ -2558,8 +2560,15 @@ void TextContext::run_tensor_parallel(Tensor& x, Phase ph, Tap& tap) {
     const bool dense = std::all_of(
         parameters_.text.layers.begin(), parameters_.text.layers.end(),
         [](const BlockParameters& block) { return std::holds_alternative<DenseParameters>(block.ffn); });
-    if (ph == Phase::Prefill && !Tap::enabled && dense && !positions && steering_ == nullptr &&
-        active_segments_.empty() && active_sequence_batch_ == 0 &&
+    // Turing's narrow projection tiles and side-stream synchronization lose to a whole-chunk
+    // exchange. NINFER_TP_PROMPT_PIECES=1 restores the upstream schedule for A/B; other tiers keep it.
+    static const bool prompt_pieces_enabled = [] {
+        const char* value = std::getenv("NINFER_TP_PROMPT_PIECES");
+        if (value != nullptr) { return value[0] != '0'; }
+        return ops::current_device_tier() != ops::DeviceTier::Turing;
+    }();
+    if (prompt_pieces_enabled && ph == Phase::Prefill && !Tap::enabled && dense && !positions &&
+        steering_ == nullptr && active_segments_.empty() && active_sequence_batch_ == 0 &&
         active_causal_attention_envelope_ != nullptr && current[0] != nullptr &&
         current[0]->numel() == T && current[1] != nullptr && current[1]->numel() == T &&
         current[3] == nullptr && T >= 2 * kTensorParallelPieceColumns) {

@@ -122,6 +122,20 @@ void quantize_matrix_activation(GgmlType type, const __nv_bfloat16* x, int k, in
 // device (zero when the tiles divide evenly across the machine).
 [[nodiscard]] std::size_t matrix_fixup_bytes(GgmlType type, int rows, int columns);
 
+
+
+
+// Experimental SM75 dense Marlin-like route, opt-in with NINFER_GGUF_MARLIN=1. The 2026-11-15
+// A/B was slower than MMQ, so it is disabled by default. The activation buffer is an FP16
+// [columns,k] plane followed by one FP32 range factor per column. Other types/geometries use MMQ.
+[[nodiscard]] bool marlin_sm75_supported(GgmlType type, int rows, int k, int columns);
+[[nodiscard]] std::size_t marlin_sm75_activation_bytes(int k, int columns);
+void marlin_sm75_activation(const __nv_bfloat16* x, int k, int columns,
+                            const std::int32_t* input_columns, void* out, cudaStream_t stream);
+void marlin_sm75_product(GgmlType type, const void* weight, std::int64_t row_bytes, int rows,
+                         int k, const void* activation, int columns, float* out,
+                         std::int64_t out_stride, cudaStream_t stream);
+
 // out[c * out_column_stride + r] = sum_k W[r, k] x[k, c] in FP32. `k` is a whole number of the
 // kernel's 256-value steps. A matrix whose rows are shorter (row_bytes holds fewer than k values) is
 // read past each row's end into the next row, and past the last row into zeros the caller promises

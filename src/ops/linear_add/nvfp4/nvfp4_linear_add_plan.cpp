@@ -5,6 +5,7 @@
 
 #include "ops/linear/nvfp4/nvfp4_config.h"
 #include "ops/linear/nvfp4/nvfp4_int8_grouped_host.h"
+#include "ops/linear/nvfp4/nvfp4_launch.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -81,7 +82,11 @@ std::size_t nvfp4_linear_add_workspace_capacity_bytes(std::int32_t output_rows,
                                                       std::int32_t input_rows, LinearPolicy policy,
                                                       std::int32_t min_tokens,
                                                       std::int32_t max_tokens) {
-    return capacity_by_table(
+    const std::size_t qpn_bytes =
+        !allows_a4(policy) && min_tokens <= 64 && nvfp4_turing_qpn_enabled_tokens(std::min(max_tokens, 64))
+            ? nvfp4_turing_qpn_activation_bytes(input_rows, std::min(max_tokens, 64))
+            : 0;
+    return std::max(qpn_bytes, capacity_by_table(
         min_tokens, max_tokens,
         [policy](std::int32_t width) { return fused_route_table(route_key(policy), width); },
         [&](LinearRouteTable table, std::int32_t first, std::int32_t last) {
@@ -90,12 +95,16 @@ std::size_t nvfp4_linear_add_workspace_capacity_bytes(std::int32_t output_rows,
                              output_rows, input_rows, unified_policy(policy), first, last)
                        : nvfp4_linear_add_workspace_capacity_bytes_own(output_rows, input_rows,
                                                                        policy, first, last);
-        });
+        }));
 }
 
 void nvfp4_linear_add_dispatch(const Tensor& x, const Weight& weight, Tensor& residual,
                                LinearPolicy policy, WorkspaceArena& workspace,
                                cudaStream_t stream) {
+    if (!allows_a4(policy) && nvfp4_turing_qpn_supported(weight, x.ne[1])) {
+        nvfp4_turing_qpn_linear_add(x, weight, residual, workspace, stream);
+        return;
+    }
     if (fused_route_table(route_key(policy), x.ne[1]) == LinearRouteTable::Unified) {
         unified::nvfp4_linear_add_dispatch(x, weight, residual, unified_policy(policy), workspace,
                                            stream);

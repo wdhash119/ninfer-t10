@@ -650,7 +650,8 @@ void require_part_attention(const PartProjectionWeights& weights, std::int32_t h
 std::size_t attn_input_proj_workspace_capacity_bytes(const PartProjectionWeights& weights,
                                                      std::int32_t min_tokens,
                                                      std::int32_t max_tokens) {
-    return detail::project_parts_workspace_bytes(weights, min_tokens, max_tokens);
+    return detail::project_parts_workspace_bytes(weights, min_tokens, max_tokens,
+                                                 &detail::kCublasAttnInput);
 }
 
 void attn_input_proj(const Tensor& x, const PartProjectionWeights& weights, Tensor& q,
@@ -667,7 +668,7 @@ void attn_input_proj(const Tensor& x, const PartProjectionWeights& weights, Tens
     require_matrix(v, kv_rows, cols, "v");
     require_part_attention(weights, x.ne[0], query_rows, kv_rows);
     Tensor* const outputs[] = {&q, &gate, &k, &v};
-    detail::project_parts(x, weights, outputs, workspace, stream);
+    detail::project_parts(x, weights, outputs, workspace, stream, &detail::kCublasAttnInput);
 }
 
 } // namespace ninfer::ops

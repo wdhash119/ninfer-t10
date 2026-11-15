@@ -2,6 +2,7 @@
 #include "models/qwen3_5/execution/rotation.h"
 
 #include "core/weight_view.h"
+#include "ops/common/device_tier.h"
 
 #include <array>
 #include <limits>
@@ -33,6 +34,16 @@ public:
     void integer_route(LinearParameters& p, QType format, std::int32_t n, std::int32_t k) const {
 #if defined(NINFER_SM8X_COMPAT)
         if (!model_.options().prefill_a8) { return; }
+        // The TP rank shapes are intentionally not the full model's shape-table entries. On
+        // Turing, preserve the requested cuBLAS policy and let the runtime-shape resolver admit
+        // only the Qwen3.8 share geometries it actually implements.
+        if (p.policy == ops::LinearPolicy::A16Only && model_.options().prefill_cublas &&
+            ops::current_device_tier() == ops::DeviceTier::Turing &&
+            (format == QType::Q4_G64_FP16 || format == QType::Q5_G64_FP16) &&
+            p.weight.qtype == format) {
+            p.policy = ops::LinearPolicy::AllowPrefillCublas;
+            return;
+        }
         if (p.policy == ops::LinearPolicy::A16Only && p.weight.qtype == format &&
             p.weight.n == n && p.weight.k == k) {
             // The cuBLAS route is a superset: it admits everything AllowA8Int does and adds the
@@ -54,6 +65,13 @@ public:
 #if defined(NINFER_SM8X_COMPAT)
         if (!model_.options().prefill_a8) { return; }
         auto* pair = std::get_if<ops::PairedProjectionWeights>(&projection);
+        if (auto* parts = std::get_if<ops::PartProjectionWeights>(&projection);
+            parts != nullptr && model_.options().prefill_cublas &&
+            ops::current_device_tier() == ops::DeviceTier::Turing &&
+            parts->policy == ops::LinearPolicy::A16Only) {
+            parts->policy = ops::LinearPolicy::AllowPrefillCublas;
+            return;
+        }
         if (pair == nullptr || pair->policy != ops::LinearPolicy::A16Only) { return; }
         if (pair->first.qtype == first_format && pair->first.n == first_rows &&
             pair->first.k == input_rows && pair->second.qtype == second_format &&
@@ -253,6 +271,12 @@ public:
                 // The two-parent form runs gate and up through plain Linear into unrounded FP32
                 // planes under the gate's policy, so an int8 gate or up takes the family's FP32
                 // writer, which is exactly what that plane is.
+                integer_route(out.gate_up, QType::Q4_G64_FP16, out.gate_up.weight.n,
+                              out.gate_up.weight.k);
+                integer_route(out.gate_up, QType::Q5_G64_FP16, out.gate_up.weight.n,
+                              out.gate_up.weight.k);
+                integer_route(out.down, QType::Q4_G64_FP16, out.down.weight.n, out.down.weight.k);
+                integer_route(out.down, QType::Q5_G64_FP16, out.down.weight.n, out.down.weight.k);
                 nvfp4_w4a16_route(out.gate_up, 17408, 5120);
                 nvfp4_w4a16_route(out.down, 5120, 17408);
                 nvfp4_int8_route(out.gate_up, 17408, 5120);
@@ -461,26 +485,33 @@ public:
         out.ffn                 = ffn(w.ffn);
         if (w.attention) {
             const AttentionWeights& a = *w.attention;
-            out.mixer                 = AttentionParameters{
-                ops::prepare_attn_input_proj_weights(
-                    model_.rotated_input(a.query), model_.rotated_input(a.key),
-                    model_.rotated_input(a.gate), model_.rotated_input(a.value)),
-                tensor(a.query_norm), tensor(a.key_norm), rotated_linear(a.output)};
+            LinearParameters output = rotated_linear(a.output);
+            integer_route(output, QType::Q4_G64_FP16, output.weight.n, output.weight.k);
+            integer_route(output, QType::Q5_G64_FP16, output.weight.n, output.weight.k);
+            ops::ProjectionWeights projection = ops::prepare_attn_input_proj_weights(
+                model_.rotated_input(a.query), model_.rotated_input(a.key),
+                model_.rotated_input(a.gate), model_.rotated_input(a.value));
+            integer_route_pair(projection, QType::Q4_G64_FP16, 7168, QType::Q5_G64_FP16, 7168,
+                               5120);
+            out.mixer = AttentionParameters{std::move(projection), tensor(a.query_norm),
+                                            tensor(a.key_norm), std::move(output)};
         }
         if (w.gdn) {
             const GdnWeights& g = *w.gdn;
-            out.mixer           = GdnParameters{
-                ops::prepare_gdn_input_proj_weights(model_.rotated_input(g.query),
-                                                    model_.rotated_input(g.key),
-                                                    model_.rotated_input(g.value),
-                                                    model_.rotated_input(g.z)),
+            LinearParameters output = rotated_linear(g.output);
+            integer_route(output, QType::Q4_G64_FP16, output.weight.n, output.weight.k);
+            integer_route(output, QType::Q5_G64_FP16, output.weight.n, output.weight.k);
+            ops::ProjectionWeights projection = ops::prepare_gdn_input_proj_weights(
+                model_.rotated_input(g.query), model_.rotated_input(g.key),
+                model_.rotated_input(g.value), model_.rotated_input(g.z));
+            integer_route_pair(projection, QType::Q4_G64_FP16, 4096, QType::Q5_G64_FP16, 12288,
+                               5120);
+            out.mixer = GdnParameters{
+                std::move(projection),
                 ops::prepare_gdn_gating_proj_weights(model_.input(g.a_projection),
                                                      model_.input(g.b_projection)),
-                tensor(g.a_log),
-                tensor(g.dt_bias),
-                tensor(g.convolution),
-                tensor(g.norm),
-                rotated_linear(g.output)};
+                tensor(g.a_log), tensor(g.dt_bias), tensor(g.convolution), tensor(g.norm),
+                std::move(output)};
         }
         return out;
     }

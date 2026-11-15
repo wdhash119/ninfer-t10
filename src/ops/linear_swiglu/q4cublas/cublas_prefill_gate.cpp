@@ -1,5 +1,7 @@
 #include "ops/linear_swiglu/q4cublas/cublas_prefill_gate.h"
 
+#include "ops/common/device_tier.h"
+
 #include "ninfer/ops/linear_policy.h"
 #include "ops/common/device_route.h"
 
@@ -18,6 +20,11 @@ constexpr std::int32_t kIntegerTile = 128;
 const CublasPrefillFamily* cublas_linear_add_family(std::int32_t input_rows) noexcept {
     if (input_rows == 17408) { return &kCublasDown; }
     if (input_rows == 6144) { return &kCublasOut; }
+    // Qwen3.8-27B TP2/TP4 shares on Turing. Other devices retain the upstream shape coverage.
+    if (current_device_tier() == DeviceTier::Turing) {
+        if (input_rows == 8704 || input_rows == 4352) { return &kCublasDown; }
+        if (input_rows == 3072 || input_rows == 1536) { return &kCublasOut; }
+    }
     return nullptr;
 }
 

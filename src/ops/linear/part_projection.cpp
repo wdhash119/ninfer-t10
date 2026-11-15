@@ -1,6 +1,9 @@
 #include "ops/linear/part_projection.h"
 
 #include "core/device_launch.h"
+#include "ops/common/device_tier.h"
+#include "ops/linear_swiglu/q4cublas/cublas_prefill_gate.h"
+#include "ops/linear_swiglu/q4cublas/w4_cublas_prefill.h"
 #include "core/layout.h"
 #include "ninfer/ops/linear.h"
 #include "ops/linear/gguf/gguf_linear.h"
@@ -35,7 +38,7 @@ bool gguf_parts(const PartProjectionWeights& weights) {
 
 void project_parts(const Tensor& x, const PartProjectionWeights& weights,
                    std::span<Tensor* const> outputs, WorkspaceArena& workspace,
-                   cudaStream_t stream) {
+                   cudaStream_t stream, const CublasPrefillFamily* cublas_family) {
     if (gguf_parts(weights)) {
         std::vector<GgufProduct> products;
         products.reserve(weights.parts.size());
@@ -50,6 +53,24 @@ void project_parts(const Tensor& x, const PartProjectionWeights& weights,
         return;
     }
     const std::int32_t columns = x.ne[1];
+    if (cublas_family != nullptr && current_device_tier() == DeviceTier::Turing &&
+        allows_cublas_prefill(weights.policy) && cublas_prefill_takes(*cublas_family, columns)) {
+        std::vector<CublasProjection> parents;
+        std::vector<CublasProjectionDestination> destinations;
+        parents.reserve(weights.parts.size());
+        destinations.reserve(weights.parts.size());
+        for (const auto& part : weights.parts) {
+            Tensor& out = *outputs[static_cast<std::size_t>(part.output)];
+            destinations.push_back({out.data, 0, part.weight.n, out.ne[0], part.row});
+            parents.push_back({&part.weight, &destinations.back(), 1});
+        }
+        if (w4_cublas_projection_supported(parents.data(), static_cast<int>(parents.size()),
+                                           columns)) {
+            w4_cublas_projection_launch(x, parents.data(), static_cast<int>(parents.size()),
+                                        workspace, stream);
+            return;
+        }
+    }
     for (const auto& part : weights.parts) {
         Tensor& out = *outputs[static_cast<std::size_t>(part.output)];
         if (contiguous_rows(out, part)) {
@@ -71,7 +92,8 @@ void project_parts(const Tensor& x, const PartProjectionWeights& weights,
 }
 
 std::size_t project_parts_workspace_bytes(const PartProjectionWeights& weights,
-                                          std::int32_t min_tokens, std::int32_t max_tokens) {
+                                          std::int32_t min_tokens, std::int32_t max_tokens,
+                                          const CublasPrefillFamily* cublas_family) {
     if (gguf_parts(weights)) {
         std::vector<GgufShape> shapes;
         for (const auto& part : weights.parts) {
@@ -87,6 +109,18 @@ std::size_t project_parts_workspace_bytes(const PartProjectionWeights& weights,
             part.weight.qtype, part.weight.n, part.weight.k, weights.policy, min_tokens,
             max_tokens));
         widest = std::max(widest, layout.peak_bytes(1));
+    }
+    if (cublas_family != nullptr && current_device_tier() == DeviceTier::Turing &&
+        allows_cublas_prefill(weights.policy)) {
+        const std::int32_t first =
+            cublas_prefill_first_width(*cublas_family, min_tokens, max_tokens);
+        if (first != 0) {
+            std::int32_t max_rows = 0;
+            for (const auto& part : weights.parts) { max_rows = std::max(max_rows, part.weight.n); }
+            widest = std::max(widest, w4_cublas_projection_workspace_capacity_bytes(
+                                          max_rows, weights.parts.front().weight.k, first,
+                                          max_tokens));
+        }
     }
     return widest;
 }

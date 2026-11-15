@@ -215,6 +215,7 @@ std::size_t gguf_project_workspace_bytes(std::span<const GgufShape> shapes,
     std::vector<int> layouts;
     std::size_t rows = 0;
     bool dequantized = false;
+    bool marlin = false;
     for (const GgufShape& shape : shapes) {
         const auto block = gguf_block_shape(shape.qtype);
         if (!is_gguf(shape.qtype) || shape.rows <= 0 || shape.k != k || k <= 0 ||
@@ -222,6 +223,7 @@ std::size_t gguf_project_workspace_bytes(std::span<const GgufShape> shapes,
             throw std::invalid_argument("gguf workspace: unsupported product geometry");
         }
         const auto type = gguf_type(shape.qtype);
+        marlin |= gguf::marlin_sm75_supported(type, shape.rows, k, max_tokens);
         if (gguf::has_matrix_kernel(type)) {
             const int layout = gguf::matrix_activation_layout(type);
             if (std::find(layouts.begin(), layouts.end(), layout) == layouts.end()) {
@@ -257,6 +259,11 @@ std::size_t gguf_project_workspace_bytes(std::span<const GgufShape> shapes,
         }
         for (std::size_t i = 0; i < std::max<std::size_t>(layouts.size(), 1) * activations; ++i) {
             (void)layout.alloc_bytes(gguf::matrix_activation_bytes(gguf::matrix_padded_k(k), t));
+        }
+        if (marlin) {
+            for (std::size_t i = 0; i < activations; ++i) {
+                (void)layout.alloc_bytes(gguf::marlin_sm75_activation_bytes(k, t));
+            }
         }
         if (dequantized) { (void)layout.alloc_bytes(std::size_t(k) * t * 2); }
         widest = std::max(widest, layout.peak_bytes(1));
@@ -307,6 +314,11 @@ void gguf_project(const Tensor& x, std::span<const GgufProduct> products,
         void* data;
     };
     std::vector<Activation> activations;
+    struct MarlinActivation {
+        const std::int32_t* columns;
+        void* data;
+    };
+    std::vector<MarlinActivation> marlin_activations;
     std::int32_t plane_rows = 0;
     bool dequantized        = false;
     for (const auto& p : products) {
@@ -330,6 +342,21 @@ void gguf_project(const Tensor& x, std::span<const GgufProduct> products,
         const bool direct = p.f32 != nullptr && p.epilogue == GgufEpilogue::Store;
         float* out        = direct ? p.f32 + p.row : plane;
         const std::int64_t stride = direct ? p.f32_rows : w.n;
+        if (gguf::marlin_sm75_supported(type, w.n, k, t)) {
+            auto found = std::find_if(
+                marlin_activations.begin(), marlin_activations.end(),
+                [&](const MarlinActivation& a) { return a.columns == w.input_columns; });
+            if (found == marlin_activations.end()) {
+                void* data = workspace.alloc_bytes(gguf::marlin_sm75_activation_bytes(k, t)).data;
+                gguf::marlin_sm75_activation(xb, k, t, w.input_columns, data, stream);
+                marlin_activations.push_back({w.input_columns, data});
+                found = marlin_activations.end() - 1;
+            }
+            gguf::marlin_sm75_product(type, w.qdata, row_bytes(w), w.n, k, found->data, t, out,
+                                      stride, stream);
+            if (!direct) { gguf::store_plane(plane, w.n, w.n, t, output(p, 0), stream); }
+            continue;
+        }
         if (gguf::has_matrix_kernel(type)) {
             const int layout = gguf::matrix_activation_layout(type);
             auto found = std::find_if(activations.begin(), activations.end(), [&](const Activation& a) {

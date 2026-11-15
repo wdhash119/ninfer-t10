@@ -2,6 +2,7 @@
 #include "ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_plan_unified.h"
 #include "core/weight.h"
 #include "ops/linear/nvfp4/nvfp4_int8_grouped_host.h"
+#include "ops/linear/nvfp4/nvfp4_launch.h"
 #include "ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_int8_grouped.cuh"
 #include "ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_plan.h"
 
@@ -178,7 +179,11 @@ static std::size_t nvfp4_linear_swiglu_workspace_capacity_bytes_own(LinearPolicy
 std::size_t nvfp4_linear_swiglu_workspace_capacity_bytes(LinearPolicy policy,
                                                          std::int32_t min_tokens,
                                                          std::int32_t max_tokens) {
-    return capacity_by_table(
+    const std::size_t qpn_bytes =
+        !allows_a4(policy) && min_tokens <= 64 && nvfp4_turing_qpn_enabled_tokens(std::min(max_tokens, 64))
+            ? nvfp4_turing_qpn_swiglu_workspace_bytes(5120, std::min(max_tokens, 64))
+            : 0;
+    return std::max(qpn_bytes, capacity_by_table(
         min_tokens, max_tokens,
         [policy](std::int32_t width) { return fused_route_table(route_key(policy), width); },
         [&](LinearRouteTable table, std::int32_t first, std::int32_t last) {
@@ -186,12 +191,16 @@ std::size_t nvfp4_linear_swiglu_workspace_capacity_bytes(LinearPolicy policy,
                        ? unified::nvfp4_linear_swiglu_workspace_capacity_bytes(
                              unified_policy(policy), first, last)
                        : nvfp4_linear_swiglu_workspace_capacity_bytes_own(policy, first, last);
-        });
+        }));
 }
 
 void nvfp4_linear_swiglu_dispatch(const Tensor& x, const Weight& weight, Tensor& out,
                                   LinearPolicy policy, WorkspaceArena& workspace,
                                   cudaStream_t stream) {
+    if (!allows_a4(policy) && nvfp4_turing_qpn_supported(weight, x.ne[1])) {
+        nvfp4_turing_qpn_linear_swiglu(x, weight, out, workspace, stream);
+        return;
+    }
     if (fused_route_table(route_key(policy), x.ne[1]) == LinearRouteTable::Unified) {
         unified::nvfp4_linear_swiglu_dispatch(x, weight, out, unified_policy(policy), workspace,
                                               stream);

@@ -24,6 +24,7 @@
 #include "core/weight.h"
 #include "ninfer/ops/attn_input_proj.h"
 #include "ninfer/ops/gdn_input_proj.h"
+#include "ninfer/ops/linear.h"
 #include "ninfer/ops/linear_policy.h"
 #include "ninfer/ops/linear_add.h"
 #include "ninfer/ops/linear_swiglu.h"
@@ -112,6 +113,12 @@ float bf16_value(std::uint16_t bits) {
     float f;
     std::memcpy(&f, &u, sizeof(f));
     return f;
+}
+
+std::vector<double> read_fp32(const test::GuardedDeviceBuffer& buffer, std::size_t elements) {
+    std::vector<float> host(elements);
+    buffer.copy_to_host(host.data(), elements * sizeof(float));
+    return std::vector<double>(host.begin(), host.end());
 }
 
 std::vector<double> read_bf16(const test::GuardedDeviceBuffer& buffer, std::size_t elements) {
@@ -282,6 +289,47 @@ int run_down(std::int32_t tokens, std::int32_t kCols, bool expected) {
     }
     failures +=
         expect_route(label, workspace, static_cast<std::size_t>(kRows) * kCols, tokens, expected);
+    return failures + finish(label, s);
+}
+
+// A tensor-parallel output/down projection stores an FP32 rank partial. Cover both Q4 and Q5,
+// TP2 and TP4 input widths, and prove from workspace use that the route actually ran on Turing.
+int run_tp_partial(std::int32_t tokens, std::int32_t kCols, QType qtype,
+                   std::int32_t rows = 5120) {
+    const std::int32_t kRows = rows;
+    DeviceWeight w(qtype, kRows, kCols, 6101U + kCols);
+    const std::vector<std::uint16_t> activation = make_activation(kCols, tokens, 101U);
+    test::GuardedDeviceBuffer device_x(activation.size() * sizeof(std::uint16_t));
+    device_x.copy_from_host(activation.data(), activation.size() * sizeof(std::uint16_t));
+    const std::size_t out_elements = static_cast<std::size_t>(kRows) * tokens;
+    test::GuardedDeviceBuffer output(out_elements * sizeof(float));
+    output.fill(0xff);
+
+    WorkspaceArena workspace(std::max<std::size_t>(
+        ops::linear_workspace_capacity_bytes(qtype, kRows, kCols, kPolicy, tokens, tokens), 256));
+    Tensor x(device_x.data(), DType::BF16, {kCols, tokens});
+    Tensor destination(output.data(), DType::FP32, {kRows, tokens});
+    ops::linear(x, w.weight, destination, kPolicy, workspace, nullptr);
+    test::cuda_check(cudaDeviceSynchronize(), "synchronize cublas FP32 partial");
+
+    const bool expected = ops::current_device_tier() == ops::DeviceTier::Turing &&
+                          compiled_gate(tokens);
+    const std::string label = "Linear FP32 TP partial " + std::string(qtype == QType::Q4_G64_FP16 ? "Q4" : "Q5") +
+                              " N=" + std::to_string(kRows) + " K=" + std::to_string(kCols) +
+                              " T=" + std::to_string(tokens);
+    int failures = output.verify_guards(label);
+    failures += expect_route(label, workspace, static_cast<std::size_t>(kRows) * kCols,
+                             tokens, expected);
+    const std::vector<double> got = read_fp32(output, out_elements);
+    Samples s;
+    for (const std::int32_t token : sample_tokens(tokens, 17U)) {
+        const std::vector<float> input = token_column(activation, kCols, token);
+        for (std::uint32_t r = 0; r < 3; ++r) {
+            const std::int32_t row = pick_row(r, token, kRows);
+            s.reference.push_back(qw::dot_fp64(w.host, row, input.data(), kCols));
+            s.actual.push_back(got[static_cast<std::size_t>(token) * kRows + row]);
+        }
+    }
     return failures + finish(label, s);
 }
 
@@ -485,6 +533,14 @@ int main() {
         for (const std::int32_t tokens : {128, 512, 1000, 5377}) {
             failures += run_gdn_input(tokens, compiled_gate(tokens));
             failures += run_attn_input(tokens, compiled_gate(tokens));
+        }
+        for (const QType qtype : {QType::Q4_G64_FP16, QType::Q5_G64_FP16}) {
+            for (const std::int32_t k : {8704, 4352, 3072, 1536}) {
+                failures += run_tp_partial(1000, k, qtype);
+            }
+            for (const std::int32_t rows : {17408, 8704, 4352}) {
+                failures += run_tp_partial(1000, 5120, qtype, rows);
+            }
         }
         failures += run_profile_gates();
         std::cout << (failures == 0 ? "OK" : "FAIL") << " cuBLAS prefill route correctness\n";

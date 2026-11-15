@@ -1492,7 +1492,7 @@ PartGdnGeometry require_part_gdn(const PartProjectionWeights& weights) {
 void part_gdn_project(const Tensor& x, const PartProjectionWeights& weights, Tensor& qkv,
                       Tensor& z, WorkspaceArena& workspace, cudaStream_t stream) {
     Tensor* const outputs[] = {&qkv, &z};
-    detail::project_parts(x, weights, outputs, workspace, stream);
+    detail::project_parts(x, weights, outputs, workspace, stream, &detail::kCublasGdnInput);
 }
 
 } // namespace
@@ -1501,7 +1501,8 @@ std::size_t gdn_input_proj_workspace_capacity_bytes(const PartProjectionWeights&
                                                     std::int32_t min_tokens,
                                                     std::int32_t max_tokens) {
     (void)require_part_gdn(weights);
-    return detail::project_parts_workspace_bytes(weights, min_tokens, max_tokens);
+    return detail::project_parts_workspace_bytes(weights, min_tokens, max_tokens,
+                                                 &detail::kCublasGdnInput);
 }
 
 void gdn_input_proj(const Tensor& x, const PartProjectionWeights& weights, Tensor& qkv, Tensor& z,
@@ -1522,7 +1523,7 @@ std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
     require_snapshot_capacity_domain(batch_size, min_width, max_width);
     const std::int32_t batch   = std::max(batch_size, 1);
     const std::size_t project  = detail::project_parts_workspace_bytes(
-        weights, batch * min_width, batch * max_width);
+        weights, batch * min_width, batch * max_width, &detail::kCublasGdnInput);
     return composed_snapshot_capacity(rows.qkv, batch * max_width, project);
 }
 
@@ -1558,7 +1559,8 @@ std::size_t gdn_input_proj_conv_record_workspace_capacity_bytes(
     (void)require_part_gdn(weights);
     require_snapshot_capacity_domain(batch_size, min_width, max_width);
     const std::int32_t batch = std::max(batch_size, 1);
-    return detail::project_parts_workspace_bytes(weights, batch * min_width, batch * max_width);
+    return detail::project_parts_workspace_bytes(weights, batch * min_width, batch * max_width,
+                                                 &detail::kCublasGdnInput);
 }
 
 void gdn_input_proj_conv_record(const Tensor& x, const PartProjectionWeights& weights,

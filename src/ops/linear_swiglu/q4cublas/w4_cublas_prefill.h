@@ -131,6 +131,16 @@ void w4_cublas_swiglu_launch(const Tensor& x, const Weight& gate_up, Tensor& out
 void w4_cublas_add_launch(const Tensor& x, const Weight& weight, Tensor& residual,
                           WorkspaceArena& workspace, cudaStream_t stream);
 
+// SM75 tensor-parallel residual projections store an unrounded FP32 rank partial instead of
+// adding into a BF16 residual. The all-reduce, not this epilogue, performs the residual addition.
+void w4_cublas_store_fp32_launch(const Tensor& x, const Weight& weight, Tensor& out,
+                                 WorkspaceArena& workspace, cudaStream_t stream);
+
+// Ordinary dense BF16 output uses the same GEMM and rescaling, without a residual add or a
+// tensor-parallel FP32 partial. Keeping this as a separate epilogue avoids changing either caller.
+void w4_cublas_store_bf16_launch(const Tensor& x, const Weight& weight, Tensor& out,
+                                 WorkspaceArena& workspace, cudaStream_t stream);
+
 // The attention and GDN input projections read one parent weight and write several destinations
 // from disjoint row ranges of it, so they share an activation quantisation and, per parent, a
 // single materialisation. About a fifth of this model's linear parameters live here -- query_key,
