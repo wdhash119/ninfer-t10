@@ -5,6 +5,7 @@
 #include "ops/linear_swiglu/q4cublas/cublas_prefill_gate.h"
 #include "ops/linear_swiglu/q4cublas/w4_cublas_prefill.h"
 #include "core/layout.h"
+#include "core/qtype.h"
 #include "ninfer/ops/linear.h"
 #include "ops/linear/gguf/gguf_linear.h"
 

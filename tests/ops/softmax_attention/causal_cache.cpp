@@ -8,8 +8,8 @@
 #include "ops/kv_cache_e8_root_host.h"
 #include "ops/kv_cache_lloyd4_oracle.h"
 #include "ops/op_tester.h"
-#include "ops/softmax_attention/dense/causal_cache/launch.h"
-#include "ops/softmax_attention/dense/causal_cache/small_t_i8_launch.h"
+#include "ops/softmax_attention/dense/causal_cache/prompt_policy.h"
+#include "ops/softmax_attention/dense/causal_cache/int8/small_t_route.h"
 #include "ops/softmax_attention/oracle.h"
 
 #include <algorithm>
@@ -4248,7 +4248,7 @@ int run_fp8_prompt_cases() {
     return failures;
 }
 
-// The fast FP8 prompt kernel (prompt_fp8_fast.cuh): partial and full 64-row CTAs, a production
+// The fast FP8 prompt kernel (fp8/prompt_fast.cuh): partial and full 64-row CTAs, a production
 // prefill chunk after a long history, and a narrow width over 8K visible keys, where the plan's
 // key splits beat its unsplit launch and the merge kernel combines the splits' partial rows
 // (graph-replayed, so the split plan must survive capture).
@@ -4603,6 +4603,11 @@ int verify_workspace_capacity_contract() {
             for (const bool wide : {false, true}) {
                 const ops::CausalAttentionExecutionEnvelope envelope{1, 1025, false, wide};
                 const ops::AttentionHeadGeometry geometry{kHeadDim, heads.q_heads, heads.kv_heads};
+                // A prompt width needs workspace only for the fast prompt kernel's key-split
+                // partials (int8/prompt_fast_plan.h); a card without the standard INT8-family
+                // prompt kernel (Turing) runs the fast one whatever the envelope asks.
+                const bool fast_prompt = ops::detail::causal_attention_prompt_fast_kernel(
+                    storage, envelope.fast_prompt_kernel);
                 for (const std::int32_t first : {1, 17, 32, 33, 64, 65}) {
                     const std::size_t interval =
                         ops::causal_softmax_attention_workspace_capacity_bytes(
@@ -4612,7 +4617,8 @@ int verify_workspace_capacity_contract() {
                         const auto exact = ops::causal_softmax_attention_workspace_capacity_bytes(
                             geometry, storage, envelope, 1, tokens, tokens);
                         witness = std::max(witness, exact);
-                        if ((tokens <= (wide ? 64 : 16)) != (exact != 0)) {
+                        const bool small_t = tokens <= (wide ? 64 : 16);
+                        if (small_t ? exact == 0 : (exact != 0 && !fast_prompt)) {
                             std::cerr << "causal_softmax_attention wide route workspace mismatch\n";
                             ++failures;
                         }
@@ -4987,7 +4993,7 @@ int run_softmax_attention_prompt_split_tests() {
     return failures ? 1 : 0;
 }
 
-// The pipelined INT8 small-T tier ("8x2x32p", small_t_i8_pipelined.cuh) forced at every small-T
+// The pipelined INT8 small-T tier ("8x2x32p", int8/small_t_pipelined.cuh) forced at every small-T
 // width of both geometries, against the FP64 oracle. Empty, page-crossing and deep caches over
 // fragmented pages cover splits that hold the appended positions and splits that issue their first
 // tile before the append; an envelope past the populated keys replays through a CUDA Graph; a zero
