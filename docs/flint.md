@@ -62,7 +62,8 @@ the Qwen3.5 frontend for tokenization, chat templates, output parsing and the se
   artifact's files, with a device cache and a CPU share of decode misses
   ([below](#expert-residency)).
 
-Not built for this family: the quantized `--kv-dtype` formats (the KV cache is F16), MTP, DFlash
+Not built for this family: the quantized `--kv-dtype` formats (the KV cache is F16, `bf16` or
+`fp16`), MTP, DFlash
 and n-gram copy drafts, rotation scaling (`--rope-yarn`, `--rope-scaling-factor`: the
 full-attention blocks have no rotation to scale), strict tool arguments and structured output beside
 tools (Flint's tool markup has no grammar here), images and video (Flint reads text only), pipeline
@@ -70,9 +71,14 @@ stages, and of the context cache the shared paged KV pool, the disk tier and ses
 GPUs divide the routed experts instead (`--devices 0,1 --tensor-parallel`, experts on the devices;
 [expert parallelism](maintainer/pipeline-stages.md#expert-parallelism-of-the-other-moe-families)).
 
-The Q4_K async prompt tiles (`gguf_moe_matrix/q4_k`) apply to the Q4_K gate/up experts that the
-UD-Q4_K_XL release stores in 3 of its 47 MoE blocks, on the device or brought to it from host
-memory or disk (16-byte aligned expert tables, `MoeTable::aligned16`).
+Prompt chunks stage the matrix kernel's tiles through `cp.async` (`gguf_matrix/<format>` and
+`gguf_moe_matrix/<format>`, [device profiles](device-profiles.md#what-is-calibrated)) at every
+column tile, 16 to 128 columns, for UD-Q4_K_XL's IQ4_XS experts, its Q4_K and Q5_K matrices and
+its Q8_0 attention, where the card's profile takes them, on the device or brought to it from host
+memory or disk (16-byte aligned expert pointers, `MoeTable::aligned16`). Q6_K and IQ3_S keep the
+synchronous loop. The values are those of the synchronous loop. On an RTX 3090 (350 W) with host
+experts a 3,502-token prompt prefills at 6.07-6.08k instead of 5.02k tokens/s with the
+synchronous loop, with the same perplexity.
 
 ## Converting
 
