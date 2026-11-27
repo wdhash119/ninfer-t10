@@ -73,7 +73,7 @@ The built-in recipes are ordinary Python functions in
 | `qwen3_8_27b_nvfp4` | Imported NVFP4/FP8, FP8 embedding generated from BF16 | `quantized` |
 | `qwen3_8_27b_nvfp4_nvidia` | nvidia/Qwen3.8-27B-NVFP4 (ModelOpt AutoQuant): imported NVFP4 MLP projections and per-row FP8 attention and GDN projections; FP8 embedding, and the NVFP4 output head re-quantized to FP8 | `quantized` |
 | `qwen3_8_27b_nvfp4_orcarouter` | orcarouter/Qwen3.8-27B-Uncensored-NVFP4 (GPTQ compressed-tensors): imported NVFP4 MLP projections in layers 0-55, per-row FP8 everywhere else; FP8 embedding and output head from BF16 | `quantized` |
-| `bonsai2_27b_ternary` | Imported ternary T2 text tower with Hadamard-rotated Uses, Q8 primal embedding | `ternary` (GGUF) |
+| `bonsai2_27b_ternary` | Ternary Bonsai 2 or 2.5: the Hadamard-rotated ternary text tower, token table and output head kept as stored (PQ2_0 as `t2_g128_fp16`, PTQ1_0 as `gguf_ptq1_0`) with the signs on their Uses; an `-mtp` GGUF's MTP head in its Q4_0 blocks | `ternary` (GGUF), `vision` (mmproj GGUF) |
 | `qwen3_8_27b_gguf` | Every text, embedding, head and MTP tensor in its GGUF block format, byte for byte; an untied BF16 output head as BF16 words | `gguf` (GGUF), `vision` (mmproj GGUF) |
 | `qwen3_8_flash_next_gguf` | Qwen3.8-Flash-Next: every text tensor in its GGUF block format, byte for byte, expert banks expert-major, and the n-gram table's IQ4_NL or Q8_0 rows in the same artifact or in a table artifact of their own; every hyper-connection matrix as ggml Q8_0 rows (the release's BF16 ones re-quantised); the MTP block from an MTP GGUF, its matrices in their blocks | `gguf` (the release's first shard), `ngram` (its second shard), `vision` (mmproj GGUF), `mtp` (an MTP GGUF) |
 | `qwen3_8_flash_next_gguf_preserve` | [Native-source preservation](flash-next-native-dflash2.md): encoded expert grids, FP32 norm gamma and decay, Basalt HC8 rounding and BF16 prefill injection; explicit `--compat-bf16` for the source recipe's compatibility casts | `gguf`, `ngram` (GGUF or NVIDIA FP8 PLE safetensors), optional `vision` and `mtp` |
@@ -81,6 +81,7 @@ The built-in recipes are ordinary Python functions in
 | `gemma4_gguf` | Gemma 4 26B-A4B or the dense 31B from Google's QAT GGUF (or a mixed-format GGUF of it): every matrix in its block format (Q4_0, the tied token table Q6_K), byte for byte, a block's Q, K and V grouped into one parent when they share a format and the [gate; up] MLP projections always, the vectors and expert scales as FP32; with `--components text,mtp` the assistant from its own GGUF the same way, with `vision` the tower from the release's mmproj | `gguf`, `mtp`, `vision` (mmproj GGUF) |
 | `flint_gguf` | Flint from a llama.cpp GGUF (Unsloth's UD-Q4_K_XL or another quantization): every matrix in its block format, byte for byte, the routed experts' gate and up banks interleaved per expert by whole rows, a block's Q, K and V grouped into one parent when they share a format and the [gate; up] rows of the dense MLP and the shared expert always, the router (BF16 in the GGUF), norms and sinks as FP32 | `gguf` |
 | `deepseek_v41_gguf` | DeepSeek-V4.1-Flash from ISTA-DASLab's split GSQ-RCO GGUF, in llama.cpp's layout or the earlier one: every matrix in its block format, byte for byte, the routed experts' gate and up banks interleaved per expert by whole rows, the BF16 and F32 tensors (router, compressors, indexers, hyper-connection matrices, norms, sinks) as FP32, the Engram gate as the FP32 product of its BF16 factors; the Engram GGUF's IQ4_NL rows in the same artifact or in a table artifact of their own | `gguf` (the first shard), `engram` (the Engram GGUF), `dspark`, `vision`, `bias_vl` (the earlier layout's image routing bias) |
+| `inkling2_gguf` | Inkling 2 Mini from a llama.cpp GGUF (Unsloth's UD-IQ4_XS to UD-IQ1_M, IsValorum's APEX-I MiniPlus or another quantization), in llama.cpp's 24-block layout or the earlier 48-block one: every matrix in its block format, row for row, byte for byte (an MXFP4 expert bank as the same values in Q8_0 blocks), the BF16, F32 and Q8_0 vectors and small matrices (router, convolutions, clips, distance tables, mixing queries, controllers, norms, expert scales, sink and tap projections) as FP32; with `vision` the tower from the release's mmproj (BF16 matrices, or a Q8_0 mmproj's blocks), with `dspark` the release's drafter from its GGUF | `gguf`, `vision` (mmproj GGUF), `dspark` (the drafter's GGUF) |
 
 The QUASAR Qwen3.8-27B NVFP4 checkpoint, which quantizes every Linear layer to NVFP4, has a driver
 of its own, `python3 -m tools.convert.quasar_nvfp4 --model DIR --dflash2 REFERENCE.ninfer --out
@@ -167,19 +168,24 @@ text,vision,mtp,dflash2`). An artifact may contain several optional
 components; the Engine loads only the ones selected at startup, including at most one speculative
 backend. Component availability and startup selection are independent.
 
-### Ternary Bonsai 2 27B
+### Ternary Bonsai 2 and 2.5 27B
 
 `bonsai2_27b_ternary` ([`ternary.py`](../tools/convert/ternary.py)) builds a Qwen3.8-27B artifact
-whose text tower comes from PrismML's `Ternary-Bonsai-2-27B-PQ2_0.gguf`. Every text projection
-except the GDN A/B controls, the output head and the token-embedding table are stored as
-`t2_g128_fp16`: the ternary codes and their per-128 scales are imported without rounding. Those
+whose text tower comes from PrismML's `Ternary-Bonsai-2-27B-PQ2_0.gguf`, or from a Bonsai 2.5
+release in either of its two ternary forms. Every text projection except the GDN A/B controls, the
+output head and the token-embedding table are stored without rounding: PQ2_0 rows as
+`t2_g128_fp16` (the ternary codes and their per-128 scales), PTQ1_0 rows as `gguf_ptq1_0`, their
+28-byte blocks byte for byte ([GGUF block formats](gguf.md#formats)). Those
 matrices are Hadamard-rotated in the checkpoint, so each projection's Uses carry the
 `hadamard_signs` auxiliary of its input width (three shared vectors in total), and the runtime
 rotates the matching activations. The token table has no Use of its own: the runtime restores each
 gathered row to the primal basis with the hidden-width signs that the output head carries. The
 recipe also undoes llama.cpp's exporter conventions: GDN value heads return from the tiled to the
-grouped order, norms from `1 + w` to `w`, and `ssm_a` to `A_log`. Vision and the frontend
-resources come from the Qwen3.8-27B checkpoint, which shares the geometry. The published artifact
+grouped order, norms from `1 + w` to `w`, and `ssm_a` to `A_log`; Bonsai 2.5 stores its GDN
+controls as F32 words, which the recipe takes only when BF16 holds every one exactly. Vision and the
+frontend resources come from the Qwen3.8-27B checkpoint, which shares the geometry, or Vision from
+the release's `mmproj` GGUF with `--source vision=` (in the official Vision formats). The published
+Bonsai 2 artifact
 takes its MTP head and DFlash2 adapter from ProCreations' heads trained on Bonsai 2 itself
 ([MTP](https://huggingface.co/ProCreations/Ternary-Bonsai-2-27B-MTP),
 [DFlash2](https://huggingface.co/ProCreations/Ternary-Bonsai-2-27B-DFlash2)), which accept more drafts
@@ -203,10 +209,33 @@ python3 -m tools.convert \
 
 Without `--source mtp` the MTP head comes from the checkpoint, and `--source
 dflash2=/path/to/Qwen3.8-27B-DFlash2` selects z-lab's adapter. `--proposal` takes the proposal
-head's rows from the ternary output head itself: PrismML's T2 rows of the 131,072 most frequent
-tokens, in their own encoding and with the head's rotation, so a draft through `--lm-head-draft`
-scores those tokens exactly as the full head does. It adds 170 MiB to the file and is loaded only
-with `--lm-head-draft`.
+head's rows from the ternary output head itself: PrismML's rows of the 131,072 most frequent
+tokens, in their own encoding (T2 or PTQ1_0 blocks) and with the head's rotation, so a draft through
+the proposal head scores those tokens exactly as the full head does. It adds 170 MiB to the Bonsai 2
+file; a drafter loads it unless `--full-draft-head` keeps the drafts on the full head.
+
+Bonsai 2.5's `-mtp` GGUFs carry PrismML's MTP head as block 64: one layer in Q4_0 blocks, which
+PrismML fine-tuned from Bonsai 2's head (itself started from Qwen3.8-27B's). With `--components
+...,mtp` and no `--source mtp`, the recipe stores its blocks byte for byte as `gguf_q4_0`; the head
+reads the Engine's ordinary, unrotated activations. Bonsai 2.5 has no DFlash2 adapter. The two
+published artifacts:
+
+```bash
+python3 -m tools.convert \
+  --model /path/to/Qwen3.8-27B \
+  --recipe bonsai2_27b_ternary \
+  --source ternary=/path/to/Ternary-Bonsai-2.5-27B-PTQ1_0-mtp.gguf \
+  --source vision=/path/to/Ternary-Bonsai-2.5-27B-mmproj-BF16.gguf \
+  --components text,vision,mtp \
+  --resource chat_template.jinja=tools/chat_templates/qwen3_8.jinja \
+  --proposal \
+  --name bonsai2.5-27b \
+  --out models/Ternary-Bonsai-2.5-27B-PTQ1_0-ninfer-v3.ninfer
+```
+
+`--source ternary=.../Ternary-Bonsai-2.5-27B-PQ2_0-mtp.gguf` gives the PQ2_0 artifact. `--model`
+needs only the checkpoint's configuration and tokenizer files here. PQ2_0 and PTQ1_0 hold the same
+ternary values and scales; PTQ1_0 packs them in 1.75 bits per weight instead of 2.125.
 
 A named source whose path ends in `.gguf` opens as a GGUF file; the recipe validates its header,
 tensor set and Hadamard metadata before reading anything.
@@ -401,6 +430,21 @@ profile made by `ninfer-ngram-profile` beside the stored Engram table as
 counted for against `--source gguf`, which a table alone then also needs; the table's bytes and
 digest stay the same. Commands, runtime defaults and measurements: [DeepSeek-V4.1-Flash](deepseek-v41.md).
 
+### Inkling 2 GGUF releases
+
+`inkling2_gguf` ([`inkling2.py`](../tools/convert/inkling2.py)) imports Inkling 2 Mini from a
+llama.cpp GGUF of `thinkingmachines/Inkling-2-Mini` with `--model` holding the release's
+`config.json`, tokenizer, `chat_template.jinja` and `generation_config.json` and `--source gguf=`
+the GGUF. It reads both layouts of Unsloth's repository: llama.cpp's `inkling2_loop` of its root
+files (24 blocks, the loop's message queries and controllers per block) and the earlier `inkling2`
+in `Old_Support/` (48 unrolled blocks in the metadata, the queries global). Both convert to the same
+payload byte for byte. It checks the GGUF's metadata against the config (the stored and visited
+layers, the sliding-window pattern, the attention and expert geometry, the softcap) and imports
+every row as stored. `--components text,vision,dspark` adds the vision tower from `--source vision=`
+(the release's mmproj, projector `inkling2v`) and the DSpark drafter from `--source dspark=`
+(llama.cpp's mainline architecture `dflash`, Unsloth's root `dspark-Inkling-2-Mini-Q8_0.gguf`, its
+Markov output folded with the head; the earlier `dspark-Inkling-2-Mini-Q8_0_Old.gguf` is refused). Commands, runtime defaults and measurements: [Inkling 2 Mini](inkling2.md).
+
 ## Change part of a recipe
 
 Save the following as `my_recipe.py`:
@@ -474,6 +518,7 @@ The converter currently writes these formats:
 | `q4_g64_fp16`, `q5_g64_fp16`, `q6_g64_fp16`, `q8_g32_fp16` | `grouped_absmax`, `grouped_search` | Supply a custom method/source if needed |
 | `fp8_e4m3fn_row_bf16` | `fp8_row_maxabs` | `import_encoded` |
 | `nvfp4` | Supply a custom quantizer | `import_encoded` |
+| `mxfp8` | None: it stores exact values only | `import_encoded` (Inkling 2's exact BF16 expert banks) |
 
 `grouped_absmax` stores one FP16 scale per group and signed integer codes. `grouped_search` stores
 the same words but picks each group's scale from about seventy candidates by the rounding error

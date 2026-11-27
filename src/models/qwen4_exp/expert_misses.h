@@ -39,6 +39,7 @@
 #include <filesystem>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <vector>
@@ -54,7 +55,10 @@ struct MissLayer {
         std::int32_t rows         = 0;
         std::int32_t k            = 0;
         std::int64_t expert_bytes = 0;
-        std::vector<const void*> host;           // host experts: each expert's bytes in RAM
+        std::vector<const void*> host;           // host experts: each expert's CPU-readable bytes
+        // Device-readable aliases for host experts when host registration yields distinct VAs.
+        // Empty keeps the existing behavior for cudaHostAlloc buffers and test fixtures.
+        std::vector<const void*> device;
         std::span<const ExpertLocation> located; // disk experts: where each expert's bytes are
     };
     std::array<Projection, 3> projections;   // gate, up, down
@@ -103,6 +107,13 @@ struct MissOptions {
     std::uint32_t tail_skip_rank = 0;
     // Disk experts: a drive mirror and the direct path (core/expert_disk.h).
     ExpertDiskReads disk{};
+    // Whether a narrow call's copies (staged and admitted experts, its missing pairs) run as a
+    // kernel on the copy stream that reads the source in place, instead of the copy engine. Where
+    // a device's copies queue behind one another (serialized_copy_queue), the service's copy-engine
+    // copies would wait behind the copies a graph queued after a replayed layer's wait for them.
+    // Unset: NINFER_MISS_COPY_KERNEL=0|1 for A/B runs and diagnosis, else serialized_copy_queue().
+    // Wide calls copy with the copy engine.
+    std::optional<bool> copy_kernel;
 };
 
 struct MissStats {

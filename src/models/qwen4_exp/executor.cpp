@@ -9,7 +9,6 @@
 #include "core/host_worker_pool.h"
 #include "core/layout.h"
 #include "core/linear_attention_state.h"
-#include "core/mapped_host_copy.h"
 #include "core/paged_kv_view.h"
 #include "core/paged_kv_storage.h"
 #include "core/pinned_memory.h"
@@ -363,14 +362,16 @@ struct ExpertTable {
     std::int64_t row_bytes = 0;
     std::int32_t rows      = 0;
     std::vector<const void*> pointers; // each expert's rows where the artifact put them
+    std::vector<const void*> device_pointers; // device aliases for pinned host experts, if any
     DeviceBuffer table;
     bool aligned16 = false;
 
     // A null entry (another rank's expert) is never read.
     void seal() {
-        aligned16 = std::any_of(pointers.begin(), pointers.end(),
+        const auto& entries = device_pointers.empty() ? pointers : device_pointers;
+        aligned16 = std::any_of(entries.begin(), entries.end(),
                                 [](const void* pointer) { return pointer != nullptr; }) &&
-                    std::all_of(pointers.begin(), pointers.end(), [](const void* pointer) {
+                    std::all_of(entries.begin(), entries.end(), [](const void* pointer) {
                         return reinterpret_cast<std::uintptr_t>(pointer) % 16 == 0;
                     });
     }
@@ -380,9 +381,11 @@ struct ExpertTable {
     }
 };
 
-ExpertTable make_table(const Model& model, std::span<const WeightId> ids) {
+ExpertTable make_table(const Model& model, std::span<const WeightId> ids,
+                       bool pinned_experts = false) {
     ExpertTable out;
     std::vector<const void*> pointers;
+    std::vector<const void*> device_pointers;
     for (const WeightId id : ids) {
         const Weight w = native_weight(model.weight(id).view);
         if (!is_gguf(w.qtype)) {
@@ -399,11 +402,18 @@ ExpertTable make_table(const Model& model, std::span<const WeightId> ids) {
                                         ": every expert of a bank must share its block type");
         }
         pointers.push_back(w.qdata);
+        if (pinned_experts) {
+            const auto* alias = model.pinned_device_alias(w.qdata, std::size_t(row) * std::size_t(w.n));
+            if (!alias) { throw std::runtime_error("host expert is outside the pinned block"); }
+            device_pointers.push_back(alias);
+        }
         out.rows = w.n;
     }
     out.table = DeviceBuffer(pointers.size() * sizeof(void*));
-    out.table.copy_from_host(pointers.data(), pointers.size() * sizeof(void*));
+    const auto& device_entries = pinned_experts ? device_pointers : pointers;
+    out.table.copy_from_host(device_entries.data(), device_entries.size() * sizeof(void*));
     out.pointers = std::move(pointers);
+    out.device_pointers = std::move(device_pointers);
     out.seal();
     return out;
 }
@@ -1189,15 +1199,23 @@ struct Executor::Impl {
     // Each chunk's MoE input and hyper-connection injection between a layer's two phases.
     DeviceBuffer span_mixed, span_inject;
     std::size_t span_row_bytes = 0; // n-gram rows of one token
-    // A span's expert phase runs up to kGroupTokens of consecutive chunks in one wide call, whose
-    // matrix products then take wider column tiles: the group's routes and output. span_group is
-    // the chunks a group takes, 1 when groups are off.
-    static constexpr std::uint32_t kGroupTokens = 4096;
+    // A span's expert phase runs consecutive chunks in one wide call, whose matrix products then
+    // take wider column tiles: the group's routes and output. A group is the whole span while its
+    // call's workspace takes at most 1 / kGroupShare of the memory free when the executor starts,
+    // else kSpanChunks, else kGroupTokens' worth (planned_group_chunks). span_group is the chunks a
+    // group takes, 1 when groups are off. The workspace that only these calls reach (rank 0's from
+    // group_workspace_from on) is a cache slot between prompts, as the span's stack is.
+    static constexpr std::uint32_t kGroupTokens = 6144;
+    static constexpr std::size_t kGroupShare    = 4;
     std::uint32_t span_group = 1;
+    std::size_t start_free_bytes                = 0;
+    std::size_t group_workspace_from            = 0;
     DeviceBuffer span_ids, span_weights, span_shared, span_y;
     // A span's expert call that a wider call of the same layer follows: the pool keeps that
     // layer's experts.
     bool span_hold = false;
+    // Executor::set_span_progress: told as a span queues each layer.
+    std::function<void(std::uint32_t, std::uint32_t)> span_progress;
     // A span's last expert call of a layer: the disk cache releases the layer's experts the span's
     // earlier calls read and this one does not route to.
     bool span_last = false;
@@ -1742,9 +1760,10 @@ struct Executor::Impl {
             plan.moe.up   = make_located_table(lw.moe.located_up);
             plan.moe.down = make_located_table(lw.moe.located_down);
         } else {
-            plan.moe.gate = make_table(model, lw.moe.gate);
-            plan.moe.up   = make_table(model, lw.moe.up);
-            plan.moe.down = make_table(model, lw.moe.down);
+            const bool pinned_experts = model.options().experts == ExpertResidency::Host;
+            plan.moe.gate = make_table(model, lw.moe.gate, pinned_experts);
+            plan.moe.up   = make_table(model, lw.moe.up, pinned_experts);
+            plan.moe.down = make_table(model, lw.moe.down, pinned_experts);
         }
         plan.moe.device_resident   = model.options().experts != ExpertResidency::Host;
         plan.moe.shared_gate_table = make_table(model, std::span(&lw.moe.shared_gate, 1));
@@ -1817,8 +1836,10 @@ struct Executor::Impl {
         segments = std::move(pieces);
     }
 
-    [[nodiscard]] std::size_t workspace_bytes(std::size_t rank) const {
+    // The workspace of `rank`'s calls; without `group`, of all but a span's wide expert calls.
+    [[nodiscard]] std::size_t workspace_bytes(std::size_t rank, bool group = true) const {
         const std::int32_t t = static_cast<std::int32_t>(options.prefill_chunk);
+        const std::uint32_t chunks = group && rank == 0 ? planned_group_chunks() : 1;
         std::size_t bytes    = ops::hyper_connection_read_workspace_bytes(
             static_cast<std::int32_t>(config.hc_count),
             static_cast<std::int32_t>(config.hidden_size),
@@ -1832,11 +1853,7 @@ struct Executor::Impl {
                 bytes, ops::moe_experts_gguf_part_workspace_bytes(t, config.expert_output_scales) +
                            round_up(std::uint64_t(config.hidden_size) * t * 8));
         }
-        if (const std::uint32_t group = planned_group_chunks(); group > 1 && rank == 0) {
-            bytes = std::max(
-                bytes, ops::moe_experts_gguf_workspace_bytes(static_cast<std::int32_t>(group) * t,
-                                                             config.expert_output_scales));
-        }
+        if (chunks > 1) { bytes = std::max(bytes, group_workspace(group_tokens(chunks))); }
         std::vector<const LayerPlan*> planned;
         for (const auto& plan : layers) {
             if (plan.rank == rank) { planned.push_back(&plan); }
@@ -1873,9 +1890,8 @@ struct Executor::Impl {
             if (plan.moe.latent) {
                 // The staged misses take a whole chunk; a single call, a span group's included,
                 // a slice of at most kGgufLatentSliceTokens.
-                const std::int32_t group =
-                    rank == 0 ? static_cast<std::int32_t>(planned_group_chunks()) * t : t;
-                const std::int32_t call  = std::min(group, ops::kGgufLatentSliceTokens);
+                const std::int32_t call =
+                    std::min(static_cast<std::int32_t>(chunks) * t, ops::kGgufLatentSliceTokens);
                 const auto& latent       = *plan.moe.latent;
                 bytes = std::max({bytes,
                                   ops::moe_latent_gguf_workspace_bytes(t, latent.width, latent.groups),
@@ -2054,6 +2070,9 @@ struct Executor::Impl {
                 rank.mixer_out = nullptr;
             }
             rank.workspace = std::make_unique<DeviceArena>(workspace_bytes(r));
+            if (r == 0 && planned_group_chunks() > 1) {
+                group_workspace_from = round_up(workspace_bytes(r, false));
+            }
             std::vector<std::int32_t> identity(std::max<std::uint32_t>(pages, options.sequences));
             std::iota(identity.begin(), identity.end(), 0);
             rank.block_table = DeviceBuffer(std::size_t(pages) * 4);
@@ -2776,7 +2795,8 @@ struct Executor::Impl {
             const auto bank = [](const ExpertTable& table) {
                 return ExpertBank{.expert_bytes = std::int64_t(table.rows) * table.row_bytes,
                                   .host         = table.pointers,
-                                  .table        = table.table.p};
+                                  .table        = table.table.p,
+                                  .device       = table.device_pointers};
             };
             cache_layers.push_back(ExpertCacheLayer{.rank   = plan->rank,
                                                     .stream = ranks[plan->rank].stream,
@@ -2802,14 +2822,7 @@ struct Executor::Impl {
             memory.ranks[r].expert_cache_bytes += bytes[r];
         }
         if (profile) { cache->seed(*profile); }
-        if (staged) {
-            allocate_misses();
-            // Where a device's copies queue behind one another whatever their streams
-            // (serialized_copy_queue), a replayed layer's device-side wait for the misses can hold
-            // the copies its graph queued after it ahead of the service's own copies, which end
-            // that wait. Eager passes wait on the host and queue nothing behind the wait.
-            if (serialized_copy_queue()) { options.cuda_graphs = false; }
-        }
+        if (staged) { allocate_misses(); }
     }
 
     // A text layer's call of more than eight tokens over GGUF host experts runs from device memory
@@ -2856,6 +2869,7 @@ struct Executor::Impl {
                     p.located = located[k];
                 } else {
                     p.host = tables[k]->pointers;
+                    p.device = tables[k]->device_pointers;
                 }
             }
             if (const auto& latent = plan->moe.latent) {
@@ -5365,9 +5379,15 @@ struct Executor::Impl {
         return tokens > options.prefill_chunk ? tokens : 0;
     }
 
-    // The chunks a span takes (span_chunks), before anything is sized by it.
+    // The chunks a span takes (span_chunks), before anything is sized by it, and the memory the
+    // device has free then.
     void plan_span_chunks() {
         span_chunks = kSpanChunks;
+        {
+            RankBinding bind(device, 0);
+            std::size_t total = 0;
+            CUDA_CHECK(cudaMemGetInfo(&start_free_bytes, &total));
+        }
         const std::uint64_t further =
             std::uint64_t(kLoneSpanChunks - kSpanChunks) * options.prefill_chunk;
         if (options.sequences != 1 ||
@@ -5378,19 +5398,47 @@ struct Executor::Impl {
         const std::uint64_t token_bytes =
             std::uint64_t(config.hc_count) * config.hidden_size * 4 + config.hidden_size * 2 +
             config.hc_count * 4;
-        RankBinding bind(device, 0);
-        std::size_t free_bytes = 0, total = 0;
-        CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total));
-        if (further * token_bytes <= free_bytes / kLoneSpanShare) { span_chunks = kLoneSpanChunks; }
+        if (further * token_bytes <= start_free_bytes / kLoneSpanShare) {
+            span_chunks = kLoneSpanChunks;
+        }
     }
 
-    // The chunks one expert call of a span's expert phase takes: as many as kGroupTokens holds,
-    // with host experts, whose groups run from the pool.
+    // The chunks one expert call of a span's expert phase takes, with host experts, whose groups
+    // run from the pool (see kGroupShare). Latent experts run a group's call in slices, so their
+    // groups stay at kGroupTokens' worth: whole spans prefilled Edge0-120B 1% slower.
     [[nodiscard]] std::uint32_t planned_group_chunks() const {
         if (planned_span_tokens() == 0 || model.options().experts != ExpertResidency::Host) {
             return 1;
         }
-        return std::clamp<std::uint32_t>(kGroupTokens / options.prefill_chunk, 1, kSpanChunks);
+        const std::uint32_t c     = options.prefill_chunk;
+        const std::uint32_t least = std::clamp<std::uint32_t>(kGroupTokens / c, 1, span_chunks);
+        if (!gguf_experts()) { return least; }
+        for (const std::uint32_t g : {span_chunks, kSpanChunks}) {
+            if (g > least && group_workspace(group_tokens(g)) <= start_free_bytes / kGroupShare) {
+                return g;
+            }
+        }
+        return least;
+    }
+
+    // The most tokens a group of `chunks` chunks holds: a span holds no more than its planes do.
+    [[nodiscard]] std::uint32_t group_tokens(std::uint32_t chunks) const {
+        return std::min(chunks * options.prefill_chunk, planned_span_tokens());
+    }
+
+    // Whether a text layer's routed experts are GGUF experts (not latent or native).
+    [[nodiscard]] bool gguf_experts() const {
+        return std::any_of(layers.begin(), layers.end(), [](const LayerPlan& plan) {
+            return !plan.moe.latent && !plan.moe.native;
+        });
+    }
+
+    // The workspace of a group's wide expert call of `tokens` tokens: none past the other calls'
+    // for latent experts, whose calls run in slices.
+    [[nodiscard]] std::size_t group_workspace(std::uint32_t tokens) const {
+        return gguf_experts() ? ops::moe_experts_gguf_workspace_bytes(
+                                    static_cast<std::int32_t>(tokens), config.expert_output_scales)
+                              : 0;
     }
 
     void allocate_span() {
@@ -5419,7 +5467,7 @@ struct Executor::Impl {
         }
         span_group = planned_group_chunks();
         if (span_group > 1) {
-            const std::size_t group = std::size_t(span_group) * options.prefill_chunk;
+            const std::size_t group = group_tokens(span_group);
             const std::size_t pairs = group * config.num_experts_per_tok;
             span_ids     = DeviceBuffer(pairs * 4);
             span_weights = DeviceBuffer(pairs * 4);
@@ -5885,6 +5933,9 @@ struct Executor::Impl {
                     }
                     capture = {};
                 }
+                if (span_progress) {
+                    span_progress(std::uint32_t(i + 1), std::uint32_t(layers.size()));
+                }
             }
             span_hold   = false;
             span_last   = false;
@@ -6344,6 +6395,12 @@ struct Executor::Impl {
             }
             if (span_stack.p != nullptr) {
                 loans.push_back({.rank = 0, .base = span_stack.p, .bytes = span_stack.bytes});
+            }
+            if (group_workspace_from > 0 && ranks[0].workspace->capacity() > group_workspace_from) {
+                loans.push_back({.rank  = 0,
+                                 .base  = static_cast<std::byte*>(ranks[0].workspace->base()) +
+                                          group_workspace_from,
+                                 .bytes = ranks[0].workspace->capacity() - group_workspace_from});
             }
             if (!loans.empty()) {
                 lent_ranks.assign(device.size(), 0);
@@ -7717,6 +7774,11 @@ void Executor::forward(std::uint32_t sequence, std::span<const std::int32_t> tok
 }
 
 bool Executor::packs_prompts() const noexcept { return impl_->span_tokens != 0; }
+
+void Executor::set_span_progress(
+    std::function<void(std::uint32_t done, std::uint32_t layers)> progress) {
+    impl_->span_progress = std::move(progress);
+}
 std::uint32_t Executor::narrow_prompt_tokens() const noexcept {
     return impl_->span_tokens == 0
                ? 0
@@ -7852,7 +7914,6 @@ std::string Executor::expert_execution_profile() const {
 }
 
 bool Executor::hybrid_experts() const noexcept { return impl_->hybrid != nullptr; }
-bool Executor::cuda_graphs() const noexcept { return impl_->options.cuda_graphs; }
 std::string Executor::expert_cpu_description() const {
     return impl_->misses ? impl_->misses->cpu_description() : std::string();
 }

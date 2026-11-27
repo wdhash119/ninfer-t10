@@ -188,6 +188,7 @@ if(_ninfer_architecture_count GREATER 1 AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
 endif()
 
 # --- Global settings ---------------------------------------------------------
+option(NINFER_STATIC_CUDA_LIBS "Statically link CUDA runtime and cuBLAS" OFF)
 option(NINFER_BUILD_APPS "Build the NInfer CLI, server and perplexity evaluator" ON)
 option(BUILD_TESTING "Build NInfer tests" OFF)
 option(NINFER_BUILD_BENCHMARKS "Build NInfer benchmarks" OFF)
@@ -245,6 +246,13 @@ if(NINFER_WINDOWS_KERNEL_DLL AND NOT WIN32)
 endif()
 if(NINFER_PTXAS_VERBOSE)
   add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:-Xptxas=-v>)
+endif()
+# Source-line tables change no machine code, but they make the kernel images about 3.5 times as
+# large, and each module takes longer to load (docs/maintainer/build-system.md).
+option(NINFER_CUDA_LINEINFO
+       "Record each kernel's source lines (-lineinfo) for compute-sanitizer reports and the Nsight Compute source view" OFF)
+if(NINFER_CUDA_LINEINFO)
+  add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
 endif()
 
 set(CMAKE_CXX_STANDARD 20)

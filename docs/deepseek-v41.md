@@ -102,8 +102,8 @@ templates, output parsing and the serving protocols in a DeepSeek dialect.
 Not built for this family: the `--kv-dtype` formats (the caches hold the release's FP8/FP4 codes), MTP, DFlash
 and n-gram copy drafts, DSpark drafts while several requests decode, rotation scaling
 (`--rope-yarn`, `--rope-scaling-factor`: the compressed blocks carry the release's own YaRN), video
-and the CPU vision tower, pipeline stages, and of the context cache the shared paged KV pool, the
-disk tier and session slots. Several GPUs divide the routed experts instead (`--devices 0,1
+and the CPU vision tower, pipeline stages, and of the context cache the shared paged KV pool.
+Several GPUs divide the routed experts instead (`--devices 0,1
 --tensor-parallel` with host or disk experts: each device its own banks, cache and copies, no CPU
 share, prompts in [spans](#prompt-spans) as on one device; without `--tensor-split` the first
 device, which also holds the model, serves fewer experts, so that every device's misses take the
@@ -192,9 +192,9 @@ and comes only in llama.cpp's layout. It converts with the same command, its fir
 `--source gguf` and the base release's config; the converter takes the expert count from the GGUF.
 Its repository's Engram GGUF and mmproj are the base repository's files, so it uses the same Engram
 table. The model is one file of 71.9 GiB, published with the STQ drafter and the vision tower
-([running](#running)). 11 of its 80 expert banks, in 10 of its 40 blocks, are IQ2_XS, which CPU
-threads do not compute: in those blocks the GPU copies every miss whatever `--expert-dma-share`
-says.
+([running](#running)). 11 of its 80 expert banks, in 10 of its 40 blocks, are IQ2_XS; CPU threads
+compute a share of those blocks' misses as they do in the other blocks (in the measurements below,
+which predate that, the GPU copied every miss of the 10 blocks).
 
 The model reads the Engram GGUF only for the table's digest, and of the STQ pack only its config,
 its index and its six drafter files (3.85 GB), checking that the pack states the release's model and
@@ -304,7 +304,7 @@ then adds the CPU's sums to its own:
   quantized as q8_1, and the down rows, and adds each row times the pair's route weight into its
   token's 2^-32 fixed-point sums, as the GPU's vector kernels compute them
   ([Qwen3.8-Flash-Next's CPU share](qwen3-8-flash-next.md#the-cpu-share) gives the IQ1_S, IQ1_M,
-  IQ2_XXS and IQ2_S slice products). Integer sums do not depend on their order, so tokens, log
+  IQ2_XXS, IQ2_XS and IQ2_S slice products). Integer sums do not depend on their order, so tokens, log
   probabilities and context states do not depend on the split, the share or the thread count.
 - **Disk experts.** An expert the CPU computes from disk needs the same file read as a copied one,
   and on the host below every split of disk experts decoded slower than copying every miss
@@ -711,7 +711,9 @@ keeps instead of prefilling those tokens again:
 
 - **On its sequence.** A sequence keeps its state when its request ends, and a checkpoint of its
   window rings and compressor tails where the prompt's last user turn closes; the next turn of a
-  conversation resumes from either.
+  conversation resumes from either. The state where the prompt's last message ends also goes to an
+  image each turn (an image takes about 1 KB a position), for a repeat of the prompt and a next turn
+  whose template renders what follows that message differently.
 - **From host memory.** Before another request takes a sequence, what it held goes to an image in
   pinned host memory: the window rings, the compressor tails and the compressed caches up to its
   length. A prompt on any sequence resumes from the longest image it starts with. `--host-kv-mib`
@@ -723,6 +725,10 @@ keeps instead of prefilling those tokens again:
   Flash-Next keeps the state inside its span instead; here a span keeps one state, the one its
   prefill tail and drafter taps are planned for (`state_at`), and a second one is not
   implemented.
+- **Documents, files and slots.** A long last message also keeps a state at a span's end inside
+  it, where a later prompt with the same document and another question resumes; a prompt shorter
+  than a span keeps none. Images go to a disk tier, a prefix cache file and session slot files
+  ([Serving](serving.md#context-cache-of-the-other-families)).
 
 A window state cannot be cut back, so a prompt resumes only where a state was kept, not at an
 arbitrary common prefix.
@@ -1056,7 +1062,8 @@ cache. The model has 7,680 routed experts:
 - **The CPU share.** With the CLI and its default context the code request decoded at 31.7 tok/s
   with every miss copied, 37.5 with half of them on 30 CPU threads and 37.3 with the automatic
   share (11% of the routed experts on the CPU), with the same tokens; disk experts decoded it at
-  16.1 tok/s. In the 10 blocks with an IQ2_XS bank the GPU copies every miss.
+  16.1 tok/s. In these runs the GPU copied every miss of the 10 blocks with an IQ2_XS bank, which
+  had no CPU product then; the CPU share of those blocks has not been measured on this model.
 - **The cache.** These runs filled it from the first requests: the code request hit 70 to 72% of
   its routed experts. The build now starts it from the Coder build's own routing profile, recorded
   on 48 coding, agent and reasoning requests. On November 4, on another RTX 4090 host (450 W, a

@@ -164,6 +164,9 @@ struct LoadOptions {
     std::size_t ranks = 1;
     std::vector<std::uint32_t> stage_layers;
     ExpertResidency experts = ExpertResidency::Device;
+    // Host experts: at most this many bytes pinned, the rest read from the artifact's files
+    // (--expert-host-mib); unset, as many as the host can pin.
+    std::optional<std::uint64_t> expert_host_bytes;
     // Loads the Vision tower the artifact carries (its `vision` component, the Qwen3.5 tower) onto
     // the first stage's device, beside the token embedding its output joins.
     bool vision = false;
@@ -217,6 +220,10 @@ public:
     [[nodiscard]] WeightId embedding(std::size_t rank) const;
 
     [[nodiscard]] const BoundWeight& weight(WeightId id) const { return bound_.at(id.index); }
+
+    [[nodiscard]] const void* pinned_device_alias(const void* data, std::size_t bytes) const {
+        return backing_.pinned_device_alias(data, bytes);
+    }
 
     [[nodiscard]] std::span<const BoundWeight> weight_data() const noexcept { return bound_; }
 

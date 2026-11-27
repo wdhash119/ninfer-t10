@@ -52,20 +52,26 @@ frontend for tokenization, chat templates, output parsing and the serving protoc
   the model continues with the arguments; see [forced selection](serving.md#function-tools)),
   streaming, reasoning in its own channel when thinking is on, and causal scoring
   (`ninfer-perplexity`).
+- **Dependent launches.** On sm_90 and newer cards the decode graph launches each kernel as a
+  programmatic dependent of the one before it
+  ([programmatic dependent launch](maintainer/op-development.md#programmatic-dependent-launch)).
+  Greedy decode with MTP drafts on an RTX 5090 went from 371.1 to 382.7 tok/s with the same tokens.
 - **Prompt chunks without logits.** A chunk before the prompt's last, or before a scoring call's
   first scored position, runs its last block only up to the key/value store: that block's attention
   output, MLP and experts feed only the head. The stored rows are those of the whole block, so
   caches and logits keep their bits.
 - **Thinking.** Off unless asked for, as the release's chat template has it: a request turns it on
   with `chat_template_kwargs: {"enable_thinking": true}`, and the reasoning arrives as
-  `reasoning_content`. Gemma has no early-close control, so thinking budgets do not apply and the
-  [reasoning-loop guard](serving.md#openai-chat-completions) stops a looping reply under `conclude`
-  as under `stop`.
+  `reasoning_content`. A thinking budget (`--thinking-budget`, `--default-thinking-budget`, a
+  request's) counts the tokens of the thought channel the model opens; once reached, the engine
+  closes the channel with Qwen's early-close guidance and `<channel|>`, masks `<|channel>` for the
+  rest of the response, and the model answers. `--reasoning-loop conclude` closes it the same way
+  ([Serving](serving.md#openai-chat-completions)).
 - **Sampling defaults.** The release's `generation_config.json` (temperature 1.0, top-p 0.95) with
   top-k held at the sampler's 20 candidates.
 
 Not built for this family: DFlash and ngram copy drafts, pipeline stages over several GPUs, and of
-the context cache the shared paged KV pool, the disk tier and session slots. Several GPUs divide
+the context cache the shared paged KV pool. Several GPUs divide
 the routed experts of the MoE model instead (`--devices 0,1 --tensor-parallel`, experts on the
 devices; [expert parallelism](maintainer/pipeline-stages.md#expert-parallelism-of-the-other-moe-families)).
 
@@ -178,8 +184,9 @@ does not fit is refused at startup with the numbers.
 ## KV-cache formats
 
 `--kv-dtype` selects the caches' storage. The 16-bit default keeps F16 rows (the prompt kernels'
-type), which `bf16` and `fp16` both select. Every other format of the engine stores its codes and scales per 256-wide block with the
-engine's D256 codecs (`ops/kv_cache`), each block's codes and scales in two planes:
+type), which `bf16` and `fp16` both select. Every other format of the engine stores its codes and
+scales per 256-wide block in the engine's KV row codings (`ops/kv_cache/kv_row.h`, the same that
+Inkling 2's and Flint's 128-wide planes use), each block's codes and scales in two planes:
 
 | `--kv-dtype` | sliding blocks: keys | sliding blocks: values | full-attention plane |
 |---|---|---|---|
@@ -243,7 +250,8 @@ The startup check counts everything that grows with the context or the sequences
 checkpoints, the prompt chunk's derived keys, F16 values and full-attention mask) and keeps 1.5 GiB
 for the rest of the workspace and the CUDA graphs. A card without that room (a 16 GB one with the
 assistant or the vision tower) prefills in 1,024- or 512-token chunks instead: the check then keeps
-512 MiB, and the chunk's planned workspace with 320 MiB beside it must fit what the caches leave.
+512 MiB, and the chunk's planned workspace with 320 MiB for the CUDA graphs beside it (64 MiB for
+kernel loading when the graphs are off) must fit what the caches leave.
 
 ### Quality and speed
 
@@ -321,11 +329,16 @@ keeps instead of prefilling those tokens again:
   the assistant. Requests with the same system prompt resume after it on any sequence, also when
   they arrive together, since a prompt that has not started prefilling looks for images again at
   its first chunk. A disposable request (a decision read) leaves no image of its end.
+- **Documents, files and slots.** A long last message also keeps a state inside it, where a later
+  prompt with the same document and another question resumes; images go to a disk tier, a prefix
+  cache file and session slot files ([Serving](serving.md#context-cache-of-the-other-families)).
 
 A sliding-window state cannot be cut back at will: the rings at a position hold the window before
 it, and each block's window reaches further back through the blocks below. A prompt therefore
 resumes only where a state was kept (a sequence's end, its checkpoint, a stored image), not at an
-arbitrary common prefix.
+arbitrary common prefix. A sequence's own state can go back a little: a next prompt that departs
+from what the sequence read after its last prompt (a reply the template renders otherwise) resumes
+where it departs, the sequence taken back there, while its rings still hold that position's window.
 
 A turn that a stop string ends is the exception. Its state has read the tokens the cut removed, so
 the sequence goes back to where the stop string's match began, the state its visible text
@@ -572,7 +585,9 @@ memory and `disk` in the artifact's files, read through the OS page cache. Both 
 with the resident kernels and outputs (top-8 GeGLU, the 704-wide middle, the dense branch and the
 sandwich norms) on the GPU, except the share of decode and verification misses that CPU threads
 compute (the CPU share below). A 12 GB card runs the model this way; the GPU holds 1.7 GiB of other
-weights instead of 13.7 GiB.
+weights instead of 13.7 GiB. Host experts the pinned block cannot hold (`--expert-host-mib`, or a
+host that cannot pin them all, such as Windows past about half its RAM) are read from the
+artifact's files as disk experts are, with the same results.
 
 ```sh
 ninfer /models/gemma4.ninfer --expert-residency host
@@ -601,11 +616,13 @@ Experts reach the GPU through the shared transport (`core/expert_delivery`):
   as any other, so a model of mixed formats spends no slot bytes on room its experts lack. A miss
   the GPU copies takes a free slot of its pool, or the slot of the coldest expert of that pool the
   call does not route when its routes beat that expert's, and every four decode passes a round
-  swaps the most routed missing experts in, copied behind the calls. A prompt chunk evicts nothing;
-  it promotes its most routed experts from the bank into free slots by device copies, up to each
-  layer's share of its pool, so a long prompt does not flush decode's working set. A routing profile
-  (`--expert-profile`, else the built-in one of the model family where the build has one) fills the
-  slots at startup. `0` keeps the banks only.
+  swaps the most routed missing experts in, copied behind the calls. A prompt chunk evicts nothing
+  itself: it promotes its most routed experts from the bank into free slots by device copies, up to
+  each layer's share of its pool, and its routes join the tier's counts scaled down to the sum a
+  decode settles to, so the first decode call after it swaps in the experts the prompt calls for
+  and a long prompt does not flush decode's working set. A routing profile (`--expert-profile`,
+  else the built-in one of the model family where the build has one) fills the slots at startup
+  and seeds the counts. `0` keeps the banks only.
 - **CPU share.** Of a decode or verification call's misses that neither the cache nor the layer's
   bank holds, CPU threads compute a share from the stored blocks while the GPU copies and runs the
   rest (`--expert-dma-share`, `auto` by default: the split whose copies and CPU products end
@@ -614,7 +631,7 @@ Experts reach the GPU through the shared transport (`core/expert_delivery`):
   the BF16 middle quantized as q8_1 and the down rows as the GPU's vector kernels do, into the same
   2^-32 fixed-point sums ([the CPU share](qwen3-8-flash-next.md#the-cpu-share) describes the
   arithmetic), so outputs do not depend on the split. Q2_0, Q4_0, Q5_0, Q8_0, Q4_K, Q5_K, Q6_K,
-  IQ4_NL, IQ1_S, IQ1_M, IQ2_XXS, IQ2_S, IQ3_XXS, IQ3_S and IQ4_XS blocks have CPU products; other
+  IQ4_NL, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S and IQ4_XS blocks have CPU products; other
   layers copy every miss.
   An expert the CPU computed takes no slot; the cache's rounds decide whether it enters.
   Flash-Next's CPU share also covers the missing experts with at most eight pairs in calls of 9 to
@@ -632,12 +649,12 @@ Experts reach the GPU through the shared transport (`core/expert_delivery`):
   chunk's derived keys, F16 values and mask are backed only as far as their sequences reach (in
   256-position tiles, on devices with CUDA virtual memory management), and the cache takes the rest
   of the device. When the next positions need memory the device lacks beside its 320 MiB graph
-  reserve, the cache gives slots back: it keeps its most routed experts, moved by device copies into
-  the slots that stay, and the others leave. A reset sequence's rows go back to the device, and the
-  cache takes what is free beyond 256 MiB of headroom for the next positions. Startup still checks
-  that every sequence's whole context fits beside the layer banks, so a context never runs out of
-  memory: the cache can shrink to no slots. An explicit `--expert-cache-mib` and device experts keep
-  the whole KV allocated.
+  reserve (64 MiB for kernel loading when the graphs are off), the cache gives slots back: it keeps
+  its most routed experts, moved by device copies into the slots that stay, and the others leave. A
+  reset sequence's rows go back to the device, and the cache takes what is free beyond 256 MiB of
+  headroom for the next positions. Startup still checks that every sequence's whole context fits
+  beside the layer banks, so a context never runs out of memory: the cache can shrink to no slots.
+  An explicit `--expert-cache-mib` and device experts keep the whole KV allocated.
 
 On an RTX 4090 (450 W, PCIe 4.0 x16, CUDA 12.8) with the QAT artifact, host experts, four sequences
 of 131,072 positions and three drafts a round, 2026-10-20: commit `5ed86dff9`, which reserves every

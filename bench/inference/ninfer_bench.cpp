@@ -52,13 +52,6 @@ void require_cuda(cudaError_t status, const char* operation) {
     }
 }
 
-bool has_decode_tests(const std::vector<ninfer::bench::BenchTest>& tests) {
-    for (const auto& test : tests) {
-        if (test.has_decode()) { return true; }
-    }
-    return false;
-}
-
 ninfer::RequestOptions benchmark_request(const ninfer::bench::BenchTest& test) {
     ninfer::RequestOptions options;
     options.execution.requested_output_tokens = test.requested_output_tokens();
@@ -156,6 +149,7 @@ int main(int argc, char** argv) {
         engine_options.prefill_chunk = options.prefill_chunk;
         engine_options.fast_prefill_kernel        = options.fast_prefill_kernel;
         engine_options.kv_cache      = options.kv_cache;
+        engine_options.kv_cache_automatic = !options.kv_cache_explicit;
         engine_options.context_cache.enabled = false;
         engine_options.speculative           = options.speculative;
         engine_options.use_cuda_graph        = options.use_cuda_graph;
@@ -177,15 +171,10 @@ int main(int argc, char** argv) {
         env.fast_prefill_kernel      = options.fast_prefill_kernel;
         env.kv_cache                 = options.kv_cache;
         env.speculative              = options.speculative;
-        env.use_cuda_graph           = options.use_cuda_graph;
         env.repetitions              = options.repetitions;
         env.warmup                   = options.warmup;
         env.corpus_path              = options.corpus_path;
         env.corpus_tokens            = corpus.size();
-        if (options.use_cuda_graph && has_decode_tests(tests)) {
-            env.decode_graph_prime_output_tokens =
-                ninfer::bench::decode_graph_prime_output_tokens(options.speculative);
-        }
 
         std::cerr << "[ninfer_bench] loading " << options.artifact_path
                   << " (max_context=" << max_context
@@ -195,6 +184,7 @@ int main(int argc, char** argv) {
         env.load   = engine.load_summary();
         env.memory = engine.memory_summary();
         env.prefill_chunk = engine.options().prefill_chunk;
+        ninfer::bench::record_decode_route(env, engine.options(), tests);
 
         prime_decode_graph(engine, env, corpus);
 

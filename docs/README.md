@@ -24,6 +24,7 @@ spelling and defaults.
 | [Gemma 4 26B-A4B and 31B](gemma4.md) | converting Google's QAT GGUF releases with their MTP assistants and vision tower, what runs, speculative decoding, images and video, the defaults, measurements against llama.cpp and the numerical checks |
 | [Flint](flint.md) | converting a GGUF of Recursive's Flint, what runs, reasoning and GLM-4.7 tool calls, expert residency, measurements against llama.cpp and the numerical checks |
 | [DeepSeek-V4.1-Flash](deepseek-v41.md) | converting the GSQ-RCO IQ1_M and Coder GGUFs and their Engram table, what runs, reasoning and DSML tool calls, host and disk experts, the Engram table's residency, measurements and the numerical checks |
+| [Inkling 2 Mini](inkling2.md) | converting a GGUF of Thinking Machines' looped Inkling 2 Mini with its vision tower and DSpark drafter, what runs, the looped state's kernels, tool-call blocks, expert residency, measurements against llama.cpp and the numerical checks |
 | [Disk expert reads](expert-disk-reads.md) | disk experts striped over a second drive (`--expert-mirror`) and written by the drive straight into device memory (`--expert-direct`, NInfer's kernel modules) |
 | [Perplexity](perplexity.md) | fixed-corpus and custom-text causal perplexity, comparison rules, progress, and reports |
 | [Device profiles](device-profiles.md) | per-GPU route profiles: the built-in RTX 3090/4090/5090/PRO 6000/TITAN RTX/Tesla V100 table, calibration at first start, `ninfer-calibrate` |
@@ -33,7 +34,7 @@ spelling and defaults.
 
 ## Model artifacts
 
-The artifacts converted for this engine (Ternary Bonsai 2, the GSQ-RCO and Flash-Next conversions,
+The artifacts converted for this engine (Ternary Bonsai 2 and 2.5, the GSQ-RCO and Flash-Next conversions,
 the Qwen3.8-27B fine-tunes, Qwen3.6-35B-A3B NVFP4 and the Qwen3.8-27B DSpine drafter) are in the
 README's [Supported Models](../README.md#supported-models); their cards live on Hugging Face. The official NInfer
 artifacts load as well; their cards on Hugging Face give upstream's requirements and its

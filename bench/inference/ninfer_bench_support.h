@@ -70,6 +70,7 @@ struct BenchOptions {
     bool fast_prefill_kernel    = false;
     std::uint32_t prefill_chunk = 0; // 0: the Engine's automatic chunk
     KvCacheStorage kv_cache     = KvCacheStorage::BFloat16;
+    bool kv_cache_explicit      = false; // --kv-dtype given (else Inkling 2 stores MXFP8)
     SpeculativeOptions speculative;
     ExpertResidency expert_residency = ExpertResidency::Device;
     EmbeddingResidency embedding_residency = EmbeddingResidency::Device;
@@ -147,6 +148,11 @@ void validate_prompt_lengths(const std::vector<BenchTest>& tests, std::size_t co
 std::vector<TokenId> load_corpus_ids(const std::string& path);
 std::vector<TokenId> prompt_slice(const std::vector<TokenId>& corpus, int n_prompt);
 std::string decode_path_name(bool use_cuda_graph, const SpeculativeOptions& speculative);
+// Records the decode route the Engine runs, from its resolved options (Engine::options()): the
+// Engine turns CUDA Graphs off itself where they cannot serve (host or disk experts on Windows and
+// WSL2), whatever --cuda-graph asked for. A run with decode tests primes the graph it runs.
+void record_decode_route(BenchEnvironment& env, const EngineOptions& engine,
+                         const std::vector<BenchTest>& tests);
 std::uint32_t decode_graph_prime_output_tokens(const SpeculativeOptions& speculative);
 std::uint32_t decode_graph_prime_required_context(const SpeculativeOptions& speculative);
 

@@ -17,9 +17,10 @@
 // each layer's share of them.
 //
 // Between prompts the cache also holds the device buffers that only wide calls write, those they
-// copy a layer's uncached experts into and a prompt span's stack (lend): a wide pass takes them
-// back (reclaim), keeping the most routed of the experts they held in colder slots of the cache's
-// own, and the next decode pass returns them empty (give_back), to fill as decode routes.
+// copy a layer's uncached experts into, a prompt span's stack and the workspace that only a span's
+// wide expert calls reach (lend): a wide pass takes them back (reclaim), keeping the most routed of
+// the experts they held in colder slots of the cache's own, and the next decode pass returns them
+// empty (give_back), to fill as decode routes.
 
 #include "core/device.h"
 #include "core/expert_tier.h"
@@ -40,6 +41,7 @@ struct ExpertBank {
     std::int64_t expert_bytes = 0; // one expert's rows
     std::vector<const void*> host; // each expert's rows in the pinned host block
     void* table = nullptr;         // the device table the kernels read
+    std::vector<const void*> device; // device aliases for host entries, if distinct
 };
 
 struct ExpertCacheLayer {
@@ -92,9 +94,9 @@ public:
     void seed(const std::vector<std::vector<std::uint64_t>>& counts);
     // Every route each layer's experts took since startup.
     [[nodiscard]] std::vector<std::vector<std::uint64_t>> totals() const;
-    // The device memory of `layer`'s slots: its own block, grow's and its share of up to three
+    // The device memory of `layer`'s slots: its own block, grow's and its share of up to four
     // lent buffers (empty until then). A table entry inside any of them is a cached expert.
-    using Ranges = std::array<std::pair<std::uintptr_t, std::uintptr_t>, 5>;
+    using Ranges = std::array<std::pair<std::uintptr_t, std::uintptr_t>, 6>;
     [[nodiscard]] Ranges storage(std::size_t layer) const;
     // Once startup's allocations are done: more slots for every layer that is not full, from
     // `bytes_by_rank`, as free slots, shared as at construction (a profile's ranking continues
@@ -107,7 +109,8 @@ public:
         void* base       = nullptr;
         std::uint64_t bytes = 0;
     };
-    // After grow, at most once: up to three buffers per rank become free slots of that rank's layers
+
+    // After grow, at most once: up to four buffers per rank become free slots of that rank's layers
     // that are not full, shared as grow shares; the cache holds them until a reclaim. Returns the
     // bytes of each rank's slots.
     std::vector<std::uint64_t> lend(std::span<const Loan> loans);
@@ -127,7 +130,7 @@ public:
     struct Admitted {
         std::array<void*, 3> slot{};              // the expert's projections in its slot
         std::int32_t victim = -1;                 // the expert that left the slot, or -1
-        std::array<const void*, 3> victim_host{}; // the victim's projections in host memory
+        std::array<const void*, 3> victim_entry{}; // the victim's entries as the device table named them
     };
     // Takes a slot of a handed-over `layer` for the uncached `expert`, which the call copies to the
     // GPU anyway and routes `pairs` times: a free one, else the tier's victim among the experts

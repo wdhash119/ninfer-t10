@@ -63,16 +63,19 @@ inline void apply_automatic_speculation(SpeculativeOptions& options, bool backen
 inline void validate_speculative_cli_options(const SpeculativeOptions& options) {
     // A value out of range is an error of its own option; the rest are combinations that a later
     // option layer resolves (product/option_layers.h). The floor applies to MTP the command line
-    // names or the Engine chooses (no --spec), and to Qwen3.8-Flash-Next's DFlash2 drafter.
+    // names or the Engine chooses (no --spec), to Qwen3.8-Flash-Next's DFlash2 drafter, to DSpine
+    // and to Inkling 2's DSpark drafter (the model's core refuses it where the drafter has none).
     if (options.draft_min_p && (!std::isfinite(*options.draft_min_p) ||
                                 *options.draft_min_p < 0 || *options.draft_min_p > 1)) {
         throw std::invalid_argument("--draft-min-p takes a finite value in [0,1]");
     }
     if (options.draft_min_p && options.backend != SpeculativeBackend::Mtp &&
         options.backend != SpeculativeBackend::DFlash2 &&
-        options.backend != SpeculativeBackend::DSpine && !options.automatic) {
+        options.backend != SpeculativeBackend::DSpine &&
+        options.backend != SpeculativeBackend::DSpark && !options.automatic) {
         throw OptionConflict({"draft-min-p", "spec"},
-                             "--draft-min-p requires --spec mtp, dflash2, dspine or no --spec");
+                             "--draft-min-p requires --spec mtp, dflash2, dspine, dspark or no "
+                             "--spec");
     }
     if (options.backend == SpeculativeBackend::DSpine && options.draft_model.empty()) {
         throw OptionConflict({"spec", "draft-model"},
@@ -118,14 +121,15 @@ inline void validate_speculative_cli_options(const SpeculativeOptions& options) 
             {"mtp-attention-window", "spec", "draft-tokens"},
             "--mtp-attention-window requires --spec mtp and at least --draft-tokens + 1 keys");
     }
-    // The Qwen3.5-core models also adapt a masked drafter's rounds; the other families' Engines
-    // refuse that themselves.
+    // The Qwen3.5-core models also adapt a masked drafter's rounds and Inkling 2 its DSpark
+    // drafter's; the other families' Engines refuse that themselves.
     if (options.mtp_policy != MtpDraftPolicy::Fixed && options.backend != SpeculativeBackend::Mtp &&
         options.backend != SpeculativeBackend::DFlash &&
         options.backend != SpeculativeBackend::DFlash2 &&
-        options.backend != SpeculativeBackend::DSpine) {
+        options.backend != SpeculativeBackend::DSpine &&
+        options.backend != SpeculativeBackend::DSpark) {
         throw OptionConflict({"adaptive-mtp", "spec"},
-                             "--adaptive-mtp requires --spec mtp|dflash|dflash2|dspine");
+                             "--adaptive-mtp requires --spec mtp|dflash|dflash2|dspine|dspark");
     }
     switch (options.backend) {
     case SpeculativeBackend::None:
@@ -140,11 +144,18 @@ inline void validate_speculative_cli_options(const SpeculativeOptions& options) 
         return;
     case SpeculativeBackend::Mtp:
     case SpeculativeBackend::DFlash:
-    case SpeculativeBackend::DFlash2:
         if (options.draft_tokens == 0 || options.draft_tokens > 15) {
             throw OptionConflict({"spec", "draft-tokens"},
                                  std::string("--spec ") + speculative_backend_name(options.backend) +
                                      " requires --draft-tokens in [1,15]");
+        }
+        return;
+    case SpeculativeBackend::DFlash2:
+        // Without --draft-tokens Inkling 2's round verifies the drafter's whole block; the
+        // Qwen3.5-core models and Qwen3.8-Flash-Next refuse that themselves.
+        if (options.draft_tokens > 15) {
+            throw OptionConflict({"spec", "draft-tokens"},
+                                 "--spec dflash2 takes --draft-tokens up to 15");
         }
         return;
     case SpeculativeBackend::DSpark:

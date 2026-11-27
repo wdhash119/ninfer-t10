@@ -30,7 +30,7 @@ enum class SpeculativeBackend : std::uint8_t {
     Mtp,
     DFlash,
     DFlash2,
-    DSpark, // DeepSeek-V4.1's DSpark drafter
+    DSpark, // the release's DSpark drafter (DeepSeek-V4.1, Inkling 2)
     DSpine, // a standalone DSpine drafter artifact (SpeculativeOptions::draft_model)
 };
 
@@ -56,6 +56,11 @@ enum class EmbeddingResidency : std::uint8_t {
     // In page-locked host RAM mapped into the primary device's address space: the gather reads
     // each step's rows over the bus, and the table's device memory goes to the KV cache.
     Host,
+    // Host where the freed device memory goes to a KV pool that takes all free memory (automatic
+    // capacity with the hybrid prefix cache), no drafter reads the table and the table is the
+    // gather's alone (untied, not transcoded), on a Linux driver with the host's pinning headroom
+    // left; Device otherwise. Startup resolves it.
+    Auto,
 };
 
 // Where supported MoE families keep routed expert banks (see each family guide).
@@ -160,6 +165,20 @@ enum class PrefillTail : std::uint8_t {
     // A given count of rows before each such position, from that row on; below the exact count the
     // decoder blocks' first rows see a shorter window, which changes the output.
     Rows,
+};
+
+// Inkling 2: which keys and values the three passes of its looped core keep (--loop-kv).
+// transformers' recurrent_kv_cache_mode "last_loop" is LastAll.
+enum class LoopKvCache : std::uint8_t {
+    // Every visit keeps its own keys and values: the model's arithmetic.
+    PerPass,
+    // The core's full-attention layers keep only the last pass's keys and values. An earlier pass
+    // reads the positions before its call from the last pass's rows and the call's positions from
+    // its own, which the last pass then overwrites. Lossy, and the output depends on how the tokens
+    // are split into calls.
+    LastFull,
+    // LastFull, and the core's sliding-window layers share the last pass's ring the same way.
+    LastAll,
 };
 
 } // namespace ninfer

@@ -227,7 +227,7 @@ void fill(const Model& model, std::size_t l, std::int32_t expert, const ExpertCa
                     cudaSuccess,
                 "patch an admitted entry");
         if (out.victim >= 0) {
-            require(cudaMemcpy(table + out.victim, &out.victim_host[k], sizeof(void*),
+            require(cudaMemcpy(table + out.victim, &out.victim_entry[k], sizeof(void*),
                                cudaMemcpyHostToDevice) == cudaSuccess,
                     "patch a victim entry");
         }
@@ -442,11 +442,12 @@ void admissions(DeviceContext& device) {
     require(cache.stats().hits == before.hits + spread.size(), "afterwards they are hits");
     cache.adapt(); // a pass ends: the tier ranks the held experts
 
-    const auto refused = admit(40, 2, in_use);
+    // A newcomer enters when its pairs reach 1.5 times a victim's routes plus 2.
+    const auto refused = admit(40, 3, in_use);
     require(refused.slot[0] == nullptr && cache.cached(1, 0, 40) == nullptr,
             "a newcomer that does not beat the coldest expert by the gain stays out");
     in_use[1] = 1;
-    const auto taken = admit(41, 4, in_use);
+    const auto taken = admit(41, 5, in_use);
     require(taken.slot[0] != nullptr && taken.victim == 2,
             "the coldest expert the call does not route leaves");
     require(cache.cached(1, 0, 41) == taken.slot[0] && cache.cached(1, 0, 2) == nullptr,

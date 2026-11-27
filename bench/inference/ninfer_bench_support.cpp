@@ -65,8 +65,9 @@ KvCacheStorage parse_kv_cache(std::string_view text) {
     if (text == "nvfp4") { return KvCacheStorage::Nvfp4Group16; }
     if (text == "k8v4") { return KvCacheStorage::Fp8KeyNvfp4Value; }
     if (text == "bf16p") { return KvCacheStorage::Bf16Packed; }
+    if (text == "mxfp8") { return KvCacheStorage::Mxfp8; }
     throw std::invalid_argument("--kv-dtype must be bf16, fp16 (Flash-Next, Gemma 4, Flint), int8, fp8, rk8v4, "
-                                "rk4v4, rk4v4-e8, rk2v4-e8, nvfp4, k8v4, or bf16p");
+                                "rk4v4, rk4v4-e8, rk2v4-e8, nvfp4, k8v4, bf16p, or mxfp8 (Inkling 2)");
 }
 
 std::vector<int> parse_int_list(std::string_view value, const char* label) {
@@ -327,9 +328,8 @@ std::string usage_text(std::string_view program) {
            "                              cache misses, the CPU computing the rest (default: "
            "auto)\n"
         << "  --expert-cpu-threads <N>    host or disk experts: CPU workers (default: automatic)\n"
-        << "  --kv-dtype <bf16|fp16|int8|fp8|rk8v4|rk4v4|rk4v4-e8|rk2v4-e8|nvfp4|k8v4|bf16p>  KV "
-           "cache storage "
-           "(default: bf16)\n"
+        << "  --kv-dtype <bf16|fp16|int8|fp8|rk8v4|rk4v4|rk4v4-e8|rk2v4-e8|nvfp4|k8v4|bf16p|mxfp8>  "
+           "KV cache storage (default: bf16; mxfp8 for Inkling 2)\n"
         << "  --fast-prefill-kernel       fast INT8/FP8-KV prompt kernel, wave-aligned chunks\n"
         << "  --spec <mtp|dflash|dflash2|dspine> speculative backend (default: none)\n"
            "  --draft-model PATH          dspine: the DSpine drafter artifact\n"
@@ -417,7 +417,8 @@ BenchOptions parse_arguments(const std::vector<std::string>& arguments,
         } else if (arg == "--prefill-chunk") {
             options.prefill_chunk = parse_u32(value("--prefill-chunk"), "prefill-chunk");
         } else if (arg == "--kv-dtype") {
-            options.kv_cache = parse_kv_cache(value("--kv-dtype"));
+            options.kv_cache          = parse_kv_cache(value("--kv-dtype"));
+            options.kv_cache_explicit = true;
         } else if (arg == "--expert-residency") {
             const std::string residency = value("--expert-residency");
             if (residency == "device") {
@@ -615,6 +616,14 @@ std::string decode_path_name(bool use_cuda_graph, const SpeculativeOptions& spec
                ? execution
                : std::string(product::speculative_backend_name(speculative.backend)) + "_" +
                      execution;
+}
+
+void record_decode_route(BenchEnvironment& env, const EngineOptions& engine,
+                         const std::vector<BenchTest>& tests) {
+    env.use_cuda_graph = engine.use_cuda_graph;
+    const bool decodes = std::ranges::any_of(tests, &BenchTest::has_decode);
+    env.decode_graph_prime_output_tokens =
+        env.use_cuda_graph && decodes ? decode_graph_prime_output_tokens(env.speculative) : 0;
 }
 
 std::uint32_t decode_graph_prime_output_tokens(const SpeculativeOptions& speculative) {
@@ -1077,6 +1086,8 @@ std::string kv_cache_name(KvCacheStorage storage) {
         return "bf16p";
     case KvCacheStorage::Float16:
         return "fp16";
+    case KvCacheStorage::Mxfp8:
+        return "mxfp8";
     }
     return "unknown";
 }

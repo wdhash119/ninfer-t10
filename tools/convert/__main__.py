@@ -35,6 +35,9 @@ from .deepseek_v41 import ARCHITECTURES as DEEPSEEK_V41_ARCHITECTURES
 from .deepseek_v41 import RECIPES as DEEPSEEK_V41_RECIPES
 from .deepseek_v41 import GGUFShards
 from .deepseek_v41 import build_model as build_deepseek_v41
+from .inkling2 import ARCHITECTURES as INKLING2_ARCHITECTURES
+from .inkling2 import RECIPES as INKLING2_RECIPES
+from .inkling2 import build_model as build_inkling2
 from .dspine import RECIPES as DSPINE_RECIPES
 from .dspine import build_model as build_dspine
 from .dspine import is_dspine
@@ -95,6 +98,10 @@ class SourceInputs(Mapping):
             )
         return self._sources[name]
 
+    def __contains__(self, name):
+        # Whether the source was given, without opening it (Mapping's default reads the item).
+        return name in self._sources or name in self._paths
+
     def __iter__(self):
         return iter(dict.fromkeys((*self._sources, *self._paths)))
 
@@ -141,7 +148,7 @@ def _layers(value: str):
 def _function(value: str):
     recipes = {**RECIPES, **TERNARY_RECIPES, **GGUF_RECIPES, **QWEN4_EXP_GGUF_RECIPES,
                **EDGE0_RECIPES, **GEMMA4_RECIPES, **FLINT_RECIPES, **DEEPSEEK_V41_RECIPES,
-               **DSPINE_RECIPES}
+               **INKLING2_RECIPES, **DSPINE_RECIPES}
     if value in recipes:
         return recipes[value]
     filename, function = _recipe_parts(value)
@@ -196,7 +203,9 @@ def main(argv=None):
         "artifact), and vision or mtp (from --source mtp=MTP.gguf or an HF safetensors subset) beside text; "
         "for DeepSeek-V4.1 text,engram (the default), text or engram, and dspark (its drafter, from "
         "--source dspark=DRAFTER.gguf or an STQ pack directory) and vision (its tower, from "
-        "--source vision=MMPROJ.gguf and --source bias_vl=BIAS_VL.safetensors) beside text",
+        "--source vision=MMPROJ.gguf and --source bias_vl=BIAS_VL.safetensors) beside text; "
+        "for Inkling 2 vision, dspark and dflash2 (incoai's drafter, from --source dflash2=DIR) "
+        "beside text",
     )
     parser.add_argument(
         "--resource",
@@ -320,6 +329,50 @@ def main(argv=None):
             source_paths = {"base": {"path": str(args.model)},
                             "engram": {"path": str(paths["engram"])}}
             for name in ("gguf", "dspark", "vision", "bias_vl"):
+                if name in paths:
+                    source_paths[name] = {"path": str(paths[name])}
+            report = convert(
+                model, recipe, args.out, name=args.name,
+                provenance={"converter": "ninfer-v3", "recipe": args.recipe,
+                            "sources": source_paths},
+                device=args.device, rows_per_chunk=args.rows_per_chunk,
+                max_file_bytes=args.max_file_bytes,
+                progress=lambda index, total, job: print(
+                    f"[{index+1}/{total}] {job.parameters[0]}"
+                    + (f" (+{len(job.parameters)-1})" if len(job.parameters) > 1 else "")
+                    + f": {job.spec.format} {job.spec.shape}", flush=True))
+            print(f"wrote {args.out}: {report['objects']} objects, {len(report['files'])} files, "
+                  f"{report['seconds']:.1f}s", flush=True)
+            return
+        if architectures[0] in INKLING2_ARCHITECTURES:
+            wanted = (args.components or "text").split(",")
+            if ("gguf" not in paths or args.layers or wanted[0] != "text"
+                    or not set(wanted) <= {"text", "vision", "dspark", "dflash2"}
+                    or len(set(wanted)) != len(wanted)
+                    or any((name in wanted) != (name in paths)
+                           for name in ("vision", "dspark", "dflash2"))):
+                raise ValueError("Inkling 2 converts its text component from --source gguf=FILE; "
+                                 "--components text,vision adds its vision tower from --source "
+                                 "vision=MMPROJ.gguf, text,dspark its DSpark drafter from --source "
+                                 "dspark=DRAFTER.gguf and text,dflash2 its DFlash2 drafter from "
+                                 "--source dflash2=DIR")
+            gguf = stack.enter_context(GGUFFile(paths["gguf"]))
+            vision = stack.enter_context(GGUFFile(paths["vision"])) if "vision" in paths else None
+            dspark = stack.enter_context(GGUFFile(paths["dspark"])) if "dspark" in paths else None
+            dflash2 = (stack.enter_context(SafetensorsSource(paths["dflash2"]))
+                       if "dflash2" in paths else None)
+            model = build_inkling2(base, gguf, vision=vision, dspark=dspark, dflash2=dflash2,
+                                   resource_overrides=overrides)
+            recipe = Recipe(model)
+            inkling_sources = ({"base": base, "gguf": gguf} | ({"vision": vision} if vision else {})
+                               | ({"dspark": dspark} if dspark else {})
+                               | ({"dflash2": dflash2} if dflash2 else {}))
+            _function(args.recipe)(model, recipe, inkling_sources)
+            if args.override:
+                _function(args.override)(model, recipe, inkling_sources)
+            source_paths = {"base": {"path": str(args.model)},
+                            "gguf": {"path": str(paths["gguf"])}}
+            for name in ("vision", "dspark", "dflash2"):
                 if name in paths:
                     source_paths[name] = {"path": str(paths[name])}
             report = convert(

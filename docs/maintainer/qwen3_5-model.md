@@ -235,7 +235,9 @@ each expert plane. Both offload modes use the common `core/expert_delivery` byte
 reads may stripe over a drive mirror or land in device memory directly
 ([disk expert reads](../expert-disk-reads.md)).
 Shared experts and router weights remain resident and keep the same gated SwiGLU mathematics.
-Dense Qwen models reject host/disk expert residency.
+Dense Qwen models reject host/disk expert residency. Host planes the pinned block cannot hold
+(`Residency::PinnedOrFiles`: `--expert-host-mib`, the available memory, or on Windows and WSL2 the
+GPU's shared memory segment) keep file extents, as disk planes do.
 
 A Qwen slot has aliases for gate/up codes, high bits, scales and NVFP4 divisors, followed by the
 same down planes. RowSplit Q4/Q5/Q6 use group-64 FP16 scales; Q8 uses group-32 scales. Q5/Q6 high
@@ -280,9 +282,11 @@ copies arrive
 products end soonest by earlier calls' times): each product row is the streamed d3/d4 kernels' warp
 arithmetic reproduced lane by lane (fused multiply-adds in lane order, the shfl_down tree,
 `ops::portable_silu`), so it is the GPU's bit for bit, and a placement kernel puts the rows into
-their pairs' slots before the merge. A wide call evicts nothing; it promotes its
+their pairs' slots before the merge. A wide call evicts nothing itself: it promotes its
 most routed experts from the bank into free slots by device copies, up to each layer's share of the
-cache, so a prompt does not flush the decode working set. `--expert-cache-mib 0` keeps the banks
+cache, and its routes join the tier's counts scaled down to the sum a decode settles to
+(`ExpertTier::prompt`), so the first narrow call after it swaps in the experts the prompt calls for
+(`ExpertTier::settle`) and a long prompt does not flush the decode working set. `--expert-cache-mib 0` keeps the banks
 only. Between prompts the layer banks serve as cache slots (`core/expert_delivery`): once two
 passes have run without a wide call, a narrow call's miss that the tier does not admit enters a free
 slot of a lent bank, else the slot of its least routed expert the call does not route, and stays

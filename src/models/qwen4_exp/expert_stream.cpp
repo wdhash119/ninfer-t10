@@ -173,7 +173,7 @@ struct ExpertStream::Impl {
     std::uint64_t call       = 0;
     bool grew                = false;
     ExpertStreamStats stats;
-    ReadPool reads{kReadThreads - 1}; // the caller reads too
+    ReadPool reads{kReadThreads - 1, "expert stream"}; // the caller reads too
 
     // The batch being staged in the current half: its reads, then the copies out of the half (a
     // copy without a source zeroes its target).
@@ -538,7 +538,11 @@ struct ExpertStream::Impl {
             for (int k = 0; k < 3; ++k) {
                 const ExpertLocation& location = layer.spec.experts[k][expert];
                 std::byte* target              = base + pool.offset[k];
-                if (!windows.empty()) {
+                if (location.pinned != nullptr) {
+                    // A host expert in the pinned block crosses the bus from there.
+                    batch_copies.push_back(
+                        {target, location.pinned, static_cast<std::size_t>(location.bytes)});
+                } else if (!windows.empty()) {
                     // Each run's cover in the rank's window, and its copy out of it.
                     const DirectExpertWindow& window = *windows.at(layer.spec.rank);
                     std::uint64_t at                 = 0;

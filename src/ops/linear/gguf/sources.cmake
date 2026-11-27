@@ -28,6 +28,7 @@ add_library(ninfer_ggml_quants ${_ninfer_ggml_library_type}
   "${CMAKE_CURRENT_LIST_DIR}/ggml_mmq_q5_0.cu"
   "${CMAKE_CURRENT_LIST_DIR}/ggml_mmq_q2_0.cu"
   "${CMAKE_CURRENT_LIST_DIR}/ggml_mmq_nvfp4.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/ggml_mmq_ptq1_0.cu"
   "${CMAKE_CURRENT_LIST_DIR}/ggml_vec_q8_0.cu"
   "${CMAKE_CURRENT_LIST_DIR}/ggml_vec_q4_0.cu"
   "${CMAKE_CURRENT_LIST_DIR}/ggml_vec_q5_0.cu"
@@ -47,7 +48,8 @@ add_library(ninfer_ggml_quants ${_ninfer_ggml_library_type}
   "${CMAKE_CURRENT_LIST_DIR}/ggml_vec_iq4_nl.cu"
   "${CMAKE_CURRENT_LIST_DIR}/ggml_vec_iq4_xs.cu"
   "${CMAKE_CURRENT_LIST_DIR}/ggml_vec_mxfp4.cu"
-  "${CMAKE_CURRENT_LIST_DIR}/ggml_vec_nvfp4.cu")
+  "${CMAKE_CURRENT_LIST_DIR}/ggml_vec_nvfp4.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/ggml_vec_ptq1_0.cu")
 if(WIN32)
   # STATIC defaults to this name, but OBJECT defaults to a bare /Fd directory. Keep cache keys equal.
   set_target_properties(ninfer_ggml_quants PROPERTIES
@@ -63,7 +65,7 @@ ninfer_cuda_non_rdc_archive(ninfer_ggml_quants)
 target_compile_options(ninfer_ggml_quants PRIVATE
   $<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda>
   $<$<COMPILE_LANGUAGE:CUDA>:-Xcudafe=--diag_suppress=177>)
-target_link_libraries(ninfer_ggml_quants PRIVATE ${NINFER_CUDART_TARGET} CUDA::cublas)
+target_link_libraries(ninfer_ggml_quants PRIVATE ${NINFER_CUDART_TARGET} ${NINFER_CUBLAS_TARGET})
 # In a Windows kernel-DLL build the kernel DLL links these objects (src/ops/CMakeLists.txt).
 if(NOT NINFER_WINDOWS_KERNEL_DLL)
   target_link_libraries(ninfer_ops PRIVATE ninfer_ggml_quants)

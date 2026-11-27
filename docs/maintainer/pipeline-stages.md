@@ -252,9 +252,9 @@ container, so the cause is not confirmed.
 `--devices A,B,... --tensor-parallel` divides every layer of a Qwen3.5-core model over the devices
 instead of dealing layers out. It targets decode: each card reads only its share of the weights for
 every token. Qwen3.8-Flash-Next divides its layers too ([tensor parallelism of
-Qwen3.8-Flash-Next](#tensor-parallelism-of-qwen38-flash-next)); Gemma 4, Flint and
-DeepSeek-V4.1-Flash divide only their routed experts ([expert parallelism of the other MoE
-families](#expert-parallelism-of-the-other-moe-families)).
+Qwen3.8-Flash-Next](#tensor-parallelism-of-qwen38-flash-next)); Gemma 4, Flint,
+DeepSeek-V4.1-Flash and Inkling 2 divide only their routed experts ([expert parallelism of the
+other MoE families](#expert-parallelism-of-the-other-moe-families)).
 
 - **The shares.** Rank r holds a contiguous range of GDN key heads with the value heads that read
   them (the value-to-key head map is contiguous), their q/k/v/z projection rows, convolution
@@ -857,10 +857,13 @@ every layer over it (`Executor::run_tensor_segment`, `models/qwen4_exp/executor.
 
 ### Expert parallelism of the other MoE families
 
-Gemma 4, Flint and DeepSeek-V4.1-Flash keep every layer on rank 0 and divide only the routed
-experts of each MoE block: rank r holds experts `[e_r, e_{r+1})`, a contiguous range
+Gemma 4, Flint, DeepSeek-V4.1-Flash and Inkling 2 keep every layer on rank 0 and divide only the
+routed experts of each MoE block: rank r holds experts `[e_r, e_{r+1})`, a contiguous range
 of `--tensor-split`'s weights (`split_shares` over single experts). Rank 0 runs attention, the
-router, the shared expert, the head, the drafters and Vision, as one device does.
+router, the shared expert, the head, the drafters and Vision, as one device does (Inkling 2 also
+its depth mixes and controllers; it has no shared expert, and its pairs' expert scales travel with
+the weights). Inkling 2's decode text over two RTX 3090s equals one card's byte for byte, and its
+DSpark rounds draft there by default ([measurements](../inkling2.md#measurements)).
 
 - **A MoE call** (`ExpertParallelExchange`, `core/expert_parallel.h`). Rank 0 routes the call, then
   sends what the experts read (the q8_1 activation of a call of up to eight tokens, or the BF16 rows
@@ -878,10 +881,10 @@ router, the shared expert, the head, the drafters and Vision, as one device does
 - **Numerics.** Each pair's contribution is computed and rounded exactly as on one device and integer
   addition commutes, so the sum does not depend on the split. Where one device also sums in this
   fixed point the result is one device's bit for bit: the decode and verification calls of up to
-  eight tokens of Gemma 4, Flint and DeepSeek. Their prompt chunks on one device weigh the
-  experts' FP32 rows in FP32 in the block's combine; under expert parallelism the same rows are
+  eight tokens of Gemma 4, Flint, DeepSeek and Inkling 2. Their prompt chunks on one device weigh
+  the experts' FP32 rows in FP32 in the block's combine; under expert parallelism the same rows are
   weighted into the fixed-point sum (`moe_weighted_rows`), which rounds differently.
-- **Residency.** Gemma 4 and Flint divide device-resident experts: each
+- **Residency.** Gemma 4, Flint and Inkling 2 divide device-resident experts: each
   rank binds its rows of every bank as a piece of its own (with the matrix kernel's zero tail) and
   builds expert tables whose other entries are null. DeepSeek-V4.1-Flash, whose experts live in
   pinned host memory or the artifact's files, gives every rank an `ExpertDelivery` of its own over
@@ -890,16 +893,17 @@ router, the shared expert, the head, the drafters and Vision, as one device does
   shares by each card's copy bandwidth within its free memory (`models::default_expert_split`).
   DeepSeek sizes them once the deliveries are about to start, so that every rank's misses take the
   same time over its bus (`delivery_shares`): rank r's cache holds `room_r` bytes of its share
-  (its free memory beside the CUDA Graph reserve and the delivery's tables; rank 0's beside the
-  model, its caches and workspace) and its bus copies the rest at `bus_r` (a pinned host copy
-  measured at startup, `rank_host_copy_bandwidth`), so with `B` bytes of experts in all each rank
-  takes `(room_r + t * bus_r) / B` with `t = (B - sum room) / sum bus`. Rank 0, which also holds
-  the model, takes fewer experts; when the caches together hold every expert the shares follow the
-  cards' copy bandwidth within that room. DeepSeek runs a prompt in spans as on one device
+  (its free memory beside the delivery's tables and the launch reserve, 320 MiB with CUDA graphs and
+  64 MiB without; rank 0's beside the model, its caches and workspace) and its bus copies the rest
+  at `bus_r` (a pinned host copy measured at startup, `rank_host_copy_bandwidth`), so with `B` bytes
+  of experts in all each rank takes `(room_r + t * bus_r) / B` with
+  `t = (B - sum room) / sum bus`. Rank 0, which also holds the model, takes fewer experts; when the
+  caches together hold every expert the shares follow the cards' copy bandwidth within that room.
+  DeepSeek runs a prompt in spans as on one device
   ([prompt spans](../deepseek-v41.md#prompt-spans)): the span's buffers stay on rank 0, every MoE
   call keeps a chunk's width, and each rank's delivery fills a block's bank once for all of the
-  span's chunks. Refused: Gemma 4's and Flint's host or disk experts, DeepSeek's device experts
-  and its CPU share (`--expert-dma-share`, `--expert-cpu-threads`).
+  span's chunks. Refused: Gemma 4's, Flint's and Inkling 2's host or disk experts, DeepSeek's
+  device experts and its CPU share (`--expert-dma-share`, `--expert-cpu-threads`).
 
 Measured on 2x RTX 3090 (Vast, PCIe 4.0 x16, no peer access, so the mapped host transport;
 2026-10-26; `scripts/pods/serve_ab.py`, greedy, four short prompts of 256 tokens and a prompt of
