@@ -101,6 +101,18 @@ cmake -S . -B build -G Ninja \
 cmake --build build --target ninfer-serve -j8
 ```
 
+Configure refuses to run without the pinned media archives (`third_party/media-sources/`:
+FFmpeg 9.0.2, dav1d 1.5.4 and, since the 2026-11-27 upstream merge, Mbed TLS 4.3.0). Fetch them once
+per checkout with `scripts/fetch-media-sources.sh` ([upstream's build guide](docs/build-linux.md));
+the build itself never downloads anything.
+
+After an upstream merge, run `build/apps/ninfer-calibrate --device 0` once. The calibrated
+`nvidia-tesla-t10-sm75` entry is keyed to the build's route-catalog digest, and an entry measured
+against another catalog is ignored, which leaves the engine timing the routes at every start
+(273 s instead of 39 s). The 2026-11-27 merge moved the digest `b70799ec7029a5c2` →
+`04dc2a532ffaf48d` and the entry from 87 keys to 125; see
+[the merge report](docs/performance/tesla-t10-upstream-merge-2026-11-27.md).
+
 ### Start the C1 optimized configuration
 
 ```bash
@@ -143,6 +155,20 @@ build/apps/ninfer-serve /path/to/qwen3_8_27b_nvfp4-quasar-proposal.ninfer \
   --nvfp4-w4a8-int \
   --spec mtp --draft-tokens 4 --kv-dtype int8
 ```
+
+## What changed upstream
+
+Upstream moves fast; this fork takes it in whole merges and measures what lands on a Turing card.
+The most recent batch is **269 commits (`2026-11-20.1` → `cbb6b024`), merged as `8defe44a`**:
+Ternary Bonsai 2.5 (`PTQ1_0`, `PQ2_0`), Inkling 2 Mini with MXFP8 expert banks, Qwen3.8-Flash-Next
+span progress, WDDM expert delivery graphs, Volta far-field attention, qwen4_exp tensor-core prompt
+attention on Turing, an Mbed TLS/cpp-httplib media fetch path, and static CUDA/cuBLAS linking.
+What reaches this line from it is narrow: the GGUF vector path was rewritten around our opt-in SM75
+Marlin branch without touching it, and the route catalog gained the `gguf_moe_columns/*` keys, which
+invalidated the calibrated T10 profile. [The merge
+report](docs/performance/tesla-t10-upstream-merge-2026-11-27.md) carries the measurement, the
+digest move, and the recalibration;
+[2026-11-20](docs/performance/tesla-t10-upstream-merge-2026-11-20.md) is the merge before it.
 
 ## Where this comes from
 
